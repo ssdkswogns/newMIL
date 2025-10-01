@@ -142,8 +142,8 @@ class NystromAttention(nn.Module):
 
         # merge and combine heads
 
-        out = rearrange(out, 'b h n d -> b n (h d)', h = h)
-        out = self.to_out(out)
+        cls_out = rearrange(out, 'b h n d -> b n (h d)', h = h)
+        out = self.to_out(cls_out)
         
         
         # print(n)
@@ -153,6 +153,55 @@ class NystromAttention(nn.Module):
             attn = attn1 @ attn2_inv @ attn3
             return out, attn
 
+        return out
+    
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False,
+                 attn_drop: float = 0., proj_drop: float = 0.,
+                 use_sdpa: bool = True):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.use_sdpa = use_sdpa  # PyTorch 2.x scaled_dot_product_attention 사용 여부
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, mask=None, return_attn=False):
+        """
+        x: (B, N, C)
+        mask: (B, N)  # True=유효, False=패딩 (optional)
+        return_attn: True면 (x, attn) 반환
+        """
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)       # (3, B, H, N, D)
+        q, k, v = qkv[0], qkv[1], qkv[2]       # (B, H, N, D)
+
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)     # (B,H,N,N)
+
+        if mask is not None:
+            # mask: True=keep → False 위치를 -inf로
+            # (B,1,1,N)로 브로드캐스트
+            mask_ = mask[:, None, None, :].to(torch.bool)
+            mask_val = -torch.finfo(attn.dtype).max
+            attn = attn.masked_fill(~mask_, mask_val)
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        out = attn @ v                      # (B,H,N,D)
+
+        out = out.transpose(1, 2).reshape(B, N, C)  # (B,N,C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        if return_attn:
+            return out, attn
         return out
 
 # transformer
@@ -208,4 +257,17 @@ class Nystromformer(nn.Module):
         for attn, ff in self.layers:
             x = attn(x, mask = mask) + x
             x = ff(x) + x
+        return x
+    
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads=8, mlp_ratio=4., attn_drop=0., proj_drop=0., use_sdpa=True):
+        super().__init__()
+        self.attn = PreNorm(dim, Attention(dim, num_heads, qkv_bias=True,
+                                                 attn_drop=attn_drop, proj_drop=proj_drop,
+                                                 use_sdpa=use_sdpa))
+        self.ffn  = PreNorm(dim, FeedForward(dim, mult=mlp_ratio, dropout=proj_drop))
+
+    def forward(self, x, mask=None):
+        x = self.attn(x, mask=mask) + x
+        x = self.ffn(x) + x
         return x
