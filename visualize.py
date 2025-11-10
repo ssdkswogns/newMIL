@@ -18,7 +18,7 @@ import matplotlib.colors as mcolors
 from torch.utils.data import DataLoader
 
 # 프로젝트 모듈
-from models.timemil import TimeMIL, newTimeMIL
+from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL
 from aeon.datasets import load_classification
 from syntheticdataset import MixedSyntheticBags
 from mydataload import loadorean
@@ -28,33 +28,43 @@ from mydataload import loadorean
 # -------------------------------
 def build_testset(args):
     class_names = None
+
+    # ---- NPZ가 들어온 경우: loadorean + VizWrapper ----
+    if args.dataset == 'PAMAP2':
+        testset = loadorean(args, split='test', return_instance_labels=True)
+        seq_len, num_classes, in_dim = testset.max_len, testset.num_class, testset.feat_in
+        return testset, seq_len, num_classes, in_dim, class_names
+
+    # ---- 기존 AEON 분기 ----
     if args.dataset in ['JapaneseVowels','SpokenArabicDigits','CharacterTrajectories','InsectWingbeat']:
         testset = loadorean(args, split='test')
         seq_len, num_classes, in_dim = testset.max_len, testset.num_class, testset.feat_in
+        return testset, seq_len, num_classes, in_dim, class_names
+    
+    # ---- 기존 합성 분기 ----
+    _, _, meta = load_classification(name=args.dataset, split='train')
+    Xte, yte, _ = load_classification(name=args.dataset, split='test')
+
+    class_values = meta.get('class_values', None)
+    if class_values is not None:
+        class_names = list(class_values)
+        word_to_idx = {cls:i for i, cls in enumerate(class_values)}
+        yte_idx = torch.tensor([word_to_idx[i] for i in yte], dtype=torch.long)
     else:
-        _, _, meta = load_classification(name=args.dataset, split='train')
-        Xte, yte, _ = load_classification(name=args.dataset, split='test')
+        yte_idx = torch.tensor(yte, dtype=torch.long)
 
-        class_values = meta.get('class_values', None)
-        if class_values is not None:
-            class_names = list(class_values)
-            word_to_idx = {cls:i for i, cls in enumerate(class_values)}
-            yte_idx = torch.tensor([word_to_idx[i] for i in yte], dtype=torch.long)
-        else:
-            yte_idx = torch.tensor(yte, dtype=torch.long)
+    Xte = torch.from_numpy(Xte).permute(0, 2, 1).float()   # [N,T,D]
+    num_classes = len(class_names) if class_names is not None else int(yte_idx.max().item()+1)
+    in_dim = Xte.shape[-1]
+    seq_len = Xte.shape[1]
 
-        Xte = torch.from_numpy(Xte).permute(0, 2, 1).float()   # [N,T,D]
-        num_classes = len(class_names) if class_names is not None else int(yte_idx.max().item()+1)
-        in_dim = Xte.shape[-1]
-        seq_len = Xte.shape[1]
-
-        testset = MixedSyntheticBags(
-            X=Xte, y_idx=yte_idx, num_classes=num_classes,
-            total_bags=max(1000, len(Xte)),
-            probs={'orig':0.4, 2:0.4, 3:0.2}, total_len=seq_len,
-            min_seg_len=32, ensure_distinct_classes=True,
-            seed=args.seed, return_instance_labels=True
-        )
+    testset = MixedSyntheticBags(
+        X=Xte, y_idx=yte_idx, num_classes=num_classes,
+        total_bags=max(1000, len(Xte)),
+        probs={'orig':0.4, 2:0.4, 3:0.2}, total_len=seq_len,
+        min_seg_len=32, ensure_distinct_classes=True,
+        seed=args.seed, return_instance_labels=True
+    )
     return testset, seq_len, num_classes, in_dim, class_names
 
 # -------------------------------
@@ -65,10 +75,13 @@ def build_model(args, in_dim, num_classes, seq_len, device):
         m = TimeMIL(in_features=in_dim, n_classes=num_classes,
                     mDim=args.embed, max_seq_len=seq_len,
                     dropout=0.2, is_instance=True).to(device)
-    else:
+    elif args.model == 'newTimeMIL':
         m = newTimeMIL(in_features=in_dim, n_classes=num_classes,
                        mDim=args.embed, max_seq_len=seq_len,
                        dropout=0.2, is_instance=True).to(device)
+    else:
+        m = AmbiguousMIL(in_features=in_dim,mDim=args.embed,n_classes =num_classes,
+                        dropout=0.2, max_seq_len = seq_len, is_instance=True).to(device)
     return m
 
 # -------------------------------
@@ -184,13 +197,14 @@ def attn_class_to_time(attn4d: torch.Tensor, C: int, T: int) -> torch.Tensor:
 def main():
     parser = argparse.ArgumentParser(description="Instance argmax + (pred) attention argmax + Attention heatmap (testset only)")
     parser.add_argument('--dataset', default="BasicMotions", type=str)
-    parser.add_argument('--model', default='newTimeMIL', type=str, choices=['TimeMIL','newTimeMIL'])
+    parser.add_argument('--model', default='newTimeMIL', type=str, choices=['TimeMIL','newTimeMIL','AmbiguousMIL'])
     parser.add_argument('--embed', default=128, type=int)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--ckpt', default='', type=str, required=True)
     parser.add_argument('--save_dir', default='./explain', type=str)
+    parser.add_argument('--prepared_npz', type=str, default='./data/PAMAP2.npz', help='npz path for PAMAP2)')
     args = parser.parse_args()
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -224,8 +238,10 @@ def main():
         for bags, y_bags, y_insts in testloader:
             # 입력: [B,T,D], [B,C_gt], [B,T,C_gt]
             x = bags.to(device)
-            # 사용자가 수정한 모델 시그니처: logits, x_tokens, attn_layer1, attn_layer2
-            logits, x_tokens, attn_layer1, attn_layer2 = model(x)
+            if args.model == 'AmbiguousMIL':
+                logits, instance_logits, x_cls, x_seq, attn_layer1, attn_layer2 = model(x)
+            else:
+                logits, x_tokens, attn_layer1, attn_layer2 = model(x)
 
             B, T, C_gt = y_insts.shape
 
@@ -236,17 +252,25 @@ def main():
             else:
                 C_tok = C_gt          # 클래스 토큰 = 데이터셋 클래스 수
                 show_pred_band = True
-
+            
             # === attn_layer2에서 클래스→시간 블록 뽑기 ===
             attn_bhct = attn_class_to_time(attn_layer2, C=C_tok, T=T)  # [B,H,C_tok,T]
             attn_mean = attn_bhct.mean(dim=1)                           # [B,C_tok,T]
 
-            # pred_band: newTimeMIL에서만 계산
-            pred_bands = torch.argmax(attn_mean, dim=1) if show_pred_band else None  # [B,T] or None
+            if args.model == 'AmbiguousMIL':
+                pred_bands = torch.argmax(instance_logits, dim=2) if show_pred_band else None  # [B,T]
+            else:
+                # pred_band: newTimeMIL에서만 계산
+                # eps = 1e-9
+                # # attn_mean: [B, C_tok, T]
+                # attn_colsums = attn_mean.sum(dim=1, keepdim=True).clamp_min(eps)   # [B,1,T]
+                # attn_norm = attn_mean / attn_colsums                               # [B,C_tok,T]  # 시간 t별 클래스 분율
+                pred_bands = torch.argmax(attn_mean, dim=1) if show_pred_band else None  # [B,T]
 
             for i in range(x.shape[0]):
                 yi = y_insts[i]                      # [T,C_gt]
-                attn_ct_i = attn_mean[i]             # [C_tok,T]
+                # attn_ct_i = attn_mean[i]             # [C_tok,T]
+                attn_ct_i = attn_mean[i]
                 pred_band_i = pred_bands[i] if show_pred_band else None  # [T] or None
 
                 save_path = os.path.join(out_dir, f"{args.model}_{args.dataset}_idx{global_idx:05d}_inst_plus_attn.png")
