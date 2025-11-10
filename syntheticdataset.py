@@ -26,18 +26,6 @@ def _rand_partition(total_len: int, k: int, min_seg: int = 16) -> List[int]:
     parts[-1] += (total_len - sum(parts))
     return parts
 
-def _crop_or_tile(x: torch.Tensor, L: int) -> torch.Tensor:
-    """x: [T, D] -> [L, D]"""
-    T = x.shape[0]
-    if L == T:
-        return x
-    if L < T:
-        s = random.randint(0, T - L)
-        return x[s:s+L]
-    # L > T: tile then crop
-    rep = int(np.ceil(L / T))
-    return x.repeat((rep, 1))[:L]
-
 class MixedSyntheticBags(Dataset):
     def __init__(self, X, y_idx, num_classes, total_bags=5000,
                  probs=None, total_len=None, min_seg_len=32,
