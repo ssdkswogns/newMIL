@@ -33,7 +33,7 @@ import random
 from lookhead import Lookahead
 import warnings
 
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL
+from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL 
 
 # Suppress all warnings
 warnings.filterwarnings("ignore")
@@ -69,7 +69,7 @@ def test(testloader, milnet, criterion, args, class_names, threshold: float = 0.
             bag_label = label.cuda()
             
             if args.model == 'AmbiguousMIL':
-                logits, instance_logits, x_cls, x_seq, attn_layer1, attn_layer2 = milnet(bag_feats)
+                logits, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(bag_feats)
             else:
                 logits, x, attn_layer1, attn_layer2 = milnet(bag_feats)
             loss   = criterion(logits, bag_label)
@@ -82,7 +82,7 @@ def test(testloader, milnet, criterion, args, class_names, threshold: float = 0.
             attn_mean = attn_cls.mean(dim=1)
 
             if args.model == 'AmbiguousMIL':
-                pred_inst = torch.argmax(instance_logits, dim=2).cpu()
+                pred_inst = torch.argmax(instance_pred, dim=2).cpu()
             else:
                 pred_inst = torch.argmax(attn_mean, dim=1).cpu()
 
@@ -265,7 +265,7 @@ def main():
     elif args.model == 'newTimeMIL':
         milnet = newTimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len, is_instance= True).cuda()
     elif args.model == 'AmbiguousMIL':
-        milnet = AmbiguousMIL(args.feats_size,mDim=args.embed,n_classes =num_classes, dropout=args.dropout_node, max_seq_len = seq_len, is_instance=True).cuda()
+        milnet = AmbiguousMILwithCL(args.feats_size,mDim=args.embed,n_classes =num_classes, dropout=args.dropout_node, max_seq_len = seq_len, is_instance=True).cuda()
     else:
         raise Exception("Model not available")
     
