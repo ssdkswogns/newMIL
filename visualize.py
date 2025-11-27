@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 # 프로젝트 모듈
 from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL
 from aeon.datasets import load_classification
-from syntheticdataset import MixedSyntheticBags
+from syntheticdataset import MixedSyntheticBags, MixedSyntheticBagsConcatK
 from mydataload import loadorean
 
 # -------------------------------
@@ -58,13 +58,20 @@ def build_testset(args):
     in_dim = Xte.shape[-1]
     seq_len = Xte.shape[1]
 
-    testset = MixedSyntheticBags(
-        X=Xte, y_idx=yte_idx, num_classes=num_classes,
-        total_bags=max(1000, len(Xte)),
-        probs={'orig':0.4, 2:0.4, 3:0.2}, total_len=seq_len,
-        min_seg_len=32, ensure_distinct_classes=True,
-        seed=args.seed, return_instance_labels=True
-    )
+    # testset = MixedSyntheticBags(
+    #     X=Xte, y_idx=yte_idx, num_classes=num_classes,
+    #     total_bags=max(1000, len(Xte)),
+    #     probs={'orig':0.4, 2:0.4, 3:0.2}, total_len=seq_len,
+    #     min_seg_len=32, ensure_distinct_classes=True,
+    #     seed=args.seed, return_instance_labels=True
+    # )
+
+    testset = MixedSyntheticBagsConcatK(
+            X=Xte, y_idx=yte_idx, num_classes=num_classes,
+            total_bags=len(Xte),
+            seed=args.seed+1,
+            return_instance_labels=True
+        )
     return testset, seq_len, num_classes, in_dim, class_names
 
 # -------------------------------

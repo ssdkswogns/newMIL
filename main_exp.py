@@ -85,6 +85,76 @@ def class_token_orthogonality_loss(x_cls, diag_weight=1.0, offdiag_weight=1.0, e
 
     return diag_weight * diag_loss + offdiag_weight * offdiag_loss
 
+# def train(trainloader, milnet, criterion, optimizer, epoch, args):
+#     milnet.train()
+#     total_loss = 0
+#     sum_bag = 0.0
+#     sum_inst = 0.0
+#     sum_ortho = 0.0
+#     sum_smooth = 0.0
+#     sum_total = 0.0
+#     n = 0
+#     for batch_id, (feats, label) in enumerate(trainloader):
+#         bag_feats = feats.cuda()
+#         bag_label = label.cuda()
+#         if args.dropout_patch>0:
+#             selecy_window_indx = random.sample(range(10),int(args.dropout_patch*10))
+#             inteval = int(len(bag_feats)//10)
+#             for idx in selecy_window_indx:
+#                 bag_feats[:,idx*inteval:idx*inteval+inteval,:] = torch.randn(1).cuda()
+#         optimizer.zero_grad()
+#         if args.model == 'AmbiguousMIL':
+#             if epoch<args.epoch_des:
+#                 bag_prediction, instance_pred, x_cls, x_seq, attn_layer1, attn_layer2  = milnet(bag_feats,warmup = True)
+#             else:
+#                 bag_prediction, instance_pred, x_cls, x_seq, attn_layer1, attn_layer2  = milnet(bag_feats,warmup = False)
+#         else:
+#             if epoch<args.epoch_des:
+#                 bag_prediction  = milnet(bag_feats,warmup = True)
+#                 instance_pred = None
+#             else:
+#                 bag_prediction  = milnet(bag_feats,warmup = False)
+#                 instance_pred = None
+#         bag_loss = criterion(bag_prediction, bag_label)
+#         inst_loss = 0.0
+#         ortho_loss = torch.tensor(0.0, device=bag_feats.device)
+#         smooth_loss = torch.tensor(0.0, device=bag_feats.device)
+#         if instance_pred is not None:
+#             p_inst = torch.sigmoid(instance_pred)
+#             eps = 1e-6
+#             p_bag_from_inst = 1 - torch.prod(torch.clamp(1 - p_inst, min=eps), dim=1)
+#             inst_loss = F.binary_cross_entropy(p_bag_from_inst, bag_label.float())
+#             ortho_loss = class_token_orthogonality_loss(x_cls)
+#             smooth_loss = temporal_similarity_smooth_loss(x_seq)
+#             sparsity_per_class = p_inst.mean(dim=(0,1))
+#         if args.model == 'AmbiguousMIL':
+#             loss = args.bag_loss_w*bag_loss + args.inst_loss_w*inst_loss + args.ortho_loss_w*ortho_loss + args.smooth_loss_w*smooth_loss
+#             sys.stdout.write('\r Training bag [%d/%d] bag loss: %.4f  total loss: %.4f' % \
+#                 (batch_id, len(trainloader), bag_loss.item(),loss.item()))
+#         else:
+#             loss = bag_loss 
+#             sys.stdout.write('\r Training bag [%d/%d] bag loss: %.4f  total loss: %.4f' % \
+#                             (batch_id, len(trainloader), bag_loss.item(),loss.item()))
+#         loss.backward()
+#         torch.nn.utils.clip_grad_norm_(milnet.parameters(), 2.0)
+#         optimizer.step()
+#         total_loss += bag_loss.item()
+#         sum_bag += bag_loss.item()
+#         sum_inst += float(inst_loss) if isinstance(inst_loss, float) else inst_loss.item()
+#         sum_ortho += ortho_loss.item()
+#         sum_smooth += smooth_loss.item()
+#         sum_total += loss.item()
+#         n += 1
+#     wandb.log({
+#         "epoch": epoch,
+#         "train/bag_loss": sum_bag / max(1, n),
+#         "train/inst_loss": sum_inst / max(1, n),
+#         "train/ortho_loss": sum_ortho / max(1, n),
+#         "train/smooth_loss": sum_smooth / max(1, n),
+#         "train/total_loss": sum_total / max(1, n),
+#     }, step=epoch)
+#     return total_loss / len(trainloader)
+
 def train(trainloader, milnet, criterion, optimizer, epoch, args):
     milnet.train()
     total_loss = 0
@@ -92,66 +162,132 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args):
     sum_inst = 0.0
     sum_ortho = 0.0
     sum_smooth = 0.0
+    sum_sparsity = 0.0
     sum_total = 0.0
     n = 0
+
     for batch_id, (feats, label) in enumerate(trainloader):
         bag_feats = feats.cuda()
-        bag_label = label.cuda()
-        if args.dropout_patch>0:
-            selecy_window_indx = random.sample(range(10),int(args.dropout_patch*10))
-            inteval = int(len(bag_feats)//10)
+        bag_label = label.cuda()   # [B, C] multi-hot
+
+        if args.dropout_patch > 0:
+            selecy_window_indx = random.sample(range(10), int(args.dropout_patch * 10))
+            inteval = int(len(bag_feats) // 10)
             for idx in selecy_window_indx:
-                bag_feats[:,idx*inteval:idx*inteval+inteval,:] = torch.randn(1).cuda()
+                bag_feats[:, idx * inteval:idx * inteval + inteval, :] = torch.randn(1).cuda()
+
         optimizer.zero_grad()
+
+        # forward
         if args.model == 'AmbiguousMIL':
-            if epoch<args.epoch_des:
-                bag_prediction, instance_pred, x_cls, x_seq, attn_layer1, attn_layer2  = milnet(bag_feats,warmup = True)
+            if epoch < args.epoch_des:
+                bag_prediction, instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = milnet(
+                    bag_feats, warmup=True
+                )
             else:
-                bag_prediction, instance_pred, x_cls, x_seq, attn_layer1, attn_layer2  = milnet(bag_feats,warmup = False)
+                bag_prediction, instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = milnet(
+                    bag_feats, warmup=False
+                )
         else:
-            if epoch<args.epoch_des:
-                bag_prediction  = milnet(bag_feats,warmup = True)
+            if epoch < args.epoch_des:
+                bag_prediction = milnet(bag_feats, warmup=True)
                 instance_pred = None
             else:
-                bag_prediction  = milnet(bag_feats,warmup = False)
+                bag_prediction = milnet(bag_feats, warmup=False)
                 instance_pred = None
+
+        # bag-level loss
         bag_loss = criterion(bag_prediction, bag_label)
+
+        # 초기값 세팅
         inst_loss = 0.0
         ortho_loss = torch.tensor(0.0, device=bag_feats.device)
         smooth_loss = torch.tensor(0.0, device=bag_feats.device)
+        sparsity_loss = torch.tensor(0.0, device=bag_feats.device)   # [NEW]
+
         if instance_pred is not None:
-            p_inst = torch.sigmoid(instance_pred)
+            # instance → bag MIL loss
+            p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
+            # p_inst = torch.softmax(instance_pred, dim=2)
             eps = 1e-6
-            p_bag_from_inst = 1 - torch.prod(torch.clamp(1 - p_inst, min=eps), dim=1)
-            inst_loss = F.binary_cross_entropy(p_bag_from_inst, bag_label.float())
+            p_bag_from_inst = 1 - torch.prod(
+                torch.clamp(1 - p_inst, min=eps), dim=1
+            )                                           # [B, C]
+            inst_loss = F.binary_cross_entropy(
+                p_bag_from_inst, bag_label.float()
+            )
+
+            # class token orthogonality
             ortho_loss = class_token_orthogonality_loss(x_cls)
-            smooth_loss = temporal_similarity_smooth_loss(x_seq)
+
+            # [NEW] 이번 배치에서 실제로 등장한 positive class만 선택
+            pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+
+            # [NEW] sparsity loss (positive class만)
+            sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
+            if pos_mask.sum() > 0:
+                sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
+                    pos_mask.sum() + 1e-6
+                )
+            else:
+                sparsity_loss = torch.tensor(0.0, device=bag_feats.device)
+            sparsity_loss = sparsity_per_class.mean()  # pos_mask 제거된 기본 버전
+
+            # [NEW] temporal smoothness loss: (p_t - p_{t-1})^2
+            diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
+
+            # positive class에만 smoothness 적용
+            diff = diff * pos_mask[None, None, :]          # broadcasting
+
+            smooth_loss = (diff ** 2).mean()
+
+        # 최종 loss
         if args.model == 'AmbiguousMIL':
-            loss = args.bag_loss_w*bag_loss + args.inst_loss_w*inst_loss + args.ortho_loss_w*ortho_loss + args.smooth_loss_w*smooth_loss
-            sys.stdout.write('\r Training bag [%d/%d] bag loss: %.4f  total loss: %.4f' % \
-                (batch_id, len(trainloader), bag_loss.item(),loss.item()))
+            # [NEW] sparsity_loss를 weight와 함께 추가 (args.sparsity_loss_w 필요)
+            loss = (
+                args.bag_loss_w * bag_loss
+                + args.inst_loss_w * inst_loss
+                + args.ortho_loss_w * ortho_loss
+                + args.smooth_loss_w * smooth_loss
+                + args.sparsity_loss_w * sparsity_loss    # [NEW]
+            )
+            sys.stdout.write(
+                '\r Training bag [%d/%d] bag loss: %.4f  total loss: %.4f' %
+                (batch_id, len(trainloader), bag_loss.item(), loss.item())
+            )
         else:
-            loss = bag_loss 
-            sys.stdout.write('\r Training bag [%d/%d] bag loss: %.4f  total loss: %.4f' % \
-                            (batch_id, len(trainloader), bag_loss.item(),loss.item()))
+            loss = bag_loss
+            sys.stdout.write(
+                '\r Training bag [%d/%d] bag loss: %.4f  total loss: %.4f' %
+                (batch_id, len(trainloader), bag_loss.item(), loss.item())
+            )
+
+        # backward & step
         loss.backward()
         torch.nn.utils.clip_grad_norm_(milnet.parameters(), 2.0)
         optimizer.step()
+
+        # 통계값 누적
         total_loss += bag_loss.item()
         sum_bag += bag_loss.item()
         sum_inst += float(inst_loss) if isinstance(inst_loss, float) else inst_loss.item()
         sum_ortho += ortho_loss.item()
         sum_smooth += smooth_loss.item()
+        sum_sparsity += sparsity_loss.item()    # [NEW]
         sum_total += loss.item()
         n += 1
+
+    # wandb logging
     wandb.log({
         "epoch": epoch,
         "train/bag_loss": sum_bag / max(1, n),
         "train/inst_loss": sum_inst / max(1, n),
         "train/ortho_loss": sum_ortho / max(1, n),
         "train/smooth_loss": sum_smooth / max(1, n),
+        "train/sparsity_loss": sum_sparsity / max(1, n),  # [NEW]
         "train/total_loss": sum_total / max(1, n),
     }, step=epoch)
+
     return total_loss / len(trainloader)
 
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, average_precision_score
@@ -161,59 +297,115 @@ def test(testloader, milnet, criterion, epoch, args, threshold: float = 0.5):
     total_loss = 0.0
     all_labels = []
     all_probs  = []
+
     sum_bag = 0.0
     sum_inst = 0.0
     sum_ortho = 0.0
     sum_smooth = 0.0
+    sum_sparsity = 0.0   # [NEW]
     sum_total = 0.0
     n = 0
+
     with torch.no_grad():
         for batch_id, (feats, label) in enumerate(testloader):
             bag_feats = feats.cuda()
-            bag_label = label.cuda()
+            bag_label = label.cuda()   # [B, C]
+
             if args.model == 'AmbiguousMIL':
                 bag_prediction, instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = milnet(bag_feats)
             else:
                 bag_prediction = milnet(bag_feats)
                 instance_pred = None
+
+            # bag-level loss
             bag_loss = criterion(bag_prediction, bag_label)
+
             inst_loss = 0.0
             ortho_loss = torch.tensor(0.0, device=bag_feats.device)
             smooth_loss = torch.tensor(0.0, device=bag_feats.device)
+            sparsity_loss = torch.tensor(0.0, device=bag_feats.device)  # [NEW]
+
             if instance_pred is not None:
-                p_inst = torch.sigmoid(instance_pred)
+                # instance → bag MIL loss
+                p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
+                # p_inst = torch.softmax(instance_pred, dim=2)
                 eps = 1e-6
-                p_bag_from_inst = 1 - torch.prod(torch.clamp(1 - p_inst, min=eps), dim=1)
-                inst_loss = F.binary_cross_entropy(p_bag_from_inst, bag_label.float())
+                p_bag_from_inst = 1 - torch.prod(
+                    torch.clamp(1 - p_inst, min=eps), dim=1
+                )                                           # [B, C]
+                inst_loss = F.binary_cross_entropy(
+                    p_bag_from_inst, bag_label.float()
+                )
+
+                # class token orthogonality
                 ortho_loss = class_token_orthogonality_loss(x_cls)
-                smooth_loss = temporal_similarity_smooth_loss(x_seq)
+
+                # [NEW] 이번 배치에서 실제로 등장한 positive class만 선택
+                pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+
+                # [NEW] sparsity loss (positive class만)
+                sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
+                if pos_mask.sum() > 0:
+                    sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
+                        pos_mask.sum() + 1e-6
+                    )
+                else:
+                    sparsity_loss = torch.tensor(0.0, device=bag_feats.device)
+                sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
+
+                # [NEW] temporal smoothness loss: (p_t - p_{t-1})^2, positive class만
+                diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
+
+                diff = diff * pos_mask[None, None, :]         # broadcast
+
+                smooth_loss = (diff ** 2).mean()
+
+            # total loss
             if args.model == 'AmbiguousMIL':
-                loss = args.bag_loss_w*bag_loss + args.inst_loss_w*inst_loss + args.ortho_loss_w*ortho_loss + args.smooth_loss_w*smooth_loss
-                sys.stdout.write('\r Testing bag [%d/%d] bag loss: %.4f  total loss: %.4f' %
-                                 (batch_id, len(testloader), bag_loss.item(), loss.item()))
+                loss = (
+                    args.bag_loss_w * bag_loss
+                    + args.inst_loss_w * inst_loss
+                    + args.ortho_loss_w * ortho_loss
+                    + args.smooth_loss_w * smooth_loss
+                    + args.sparsity_loss_w * sparsity_loss   # [NEW]
+                )
+                sys.stdout.write(
+                    '\r Testing bag [%d/%d] bag loss: %.4f  total loss: %.4f' %
+                    (batch_id, len(testloader), bag_loss.item(), loss.item())
+                )
             else:
                 loss = bag_loss
-                sys.stdout.write('\r Testing bag [%d/%d] bag loss: %.4f  total loss: %.4f' %
-                                 (batch_id, len(testloader), bag_loss.item(), loss.item()))
+                sys.stdout.write(
+                    '\r Testing bag [%d/%d] bag loss: %.4f  total loss: %.4f' %
+                    (batch_id, len(testloader), bag_loss.item(), loss.item())
+                )
+
             total_loss += loss.item()
+
             probs = torch.sigmoid(bag_prediction).cpu().numpy()
             all_probs.append(probs)
             all_labels.append(label.cpu().numpy())
+
             sum_bag += bag_loss.item()
             sum_inst += float(inst_loss) if isinstance(inst_loss, float) else inst_loss.item()
             sum_ortho += ortho_loss.item()
             sum_smooth += smooth_loss.item()
+            sum_sparsity += sparsity_loss.item()   # [NEW]
             sum_total += loss.item()
             n += 1
+
+    # metric 계산
     y_true = np.vstack(all_labels)
     y_prob = np.vstack(all_probs)
     y_pred = (y_prob >= threshold).astype(np.int32)
+
     f1_micro = f1_score(y_true, y_pred, average='micro', zero_division=0)
     f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
     p_micro  = precision_score(y_true, y_pred, average='micro', zero_division=0)
     p_macro  = precision_score(y_true, y_pred, average='macro', zero_division=0)
     r_micro  = recall_score(y_true, y_pred, average='micro', zero_division=0)
     r_macro  = recall_score(y_true, y_pred, average='macro', zero_division=0)
+
     roc_list, ap_list = [], []
     for c in range(y_true.shape[1]):
         if len(np.unique(y_true[:, c])) == 2:
@@ -222,15 +414,20 @@ def test(testloader, milnet, criterion, epoch, args, threshold: float = 0.5):
                 ap_list.append(average_precision_score(y_true[:, c], y_prob[:, c]))
             except Exception:
                 pass
+
     roc_macro = float(np.mean(roc_list)) if roc_list else 0.0
     ap_macro  = float(np.mean(ap_list))  if ap_list  else 0.0
+
+    # wandb logging
     wandb.log({
         "val/bag_loss": sum_bag / max(1, n),
         "val/inst_loss": sum_inst / max(1, n),
         "val/ortho_loss": sum_ortho / max(1, n),
         "val/smooth_loss": sum_smooth / max(1, n),
+        "val/sparsity_loss": sum_sparsity / max(1, n),  # [NEW]
         "val/total_loss": sum_total / max(1, n),
     }, step=epoch)
+
     results = {
         "f1_micro": f1_micro, "f1_macro": f1_macro,
         "p_micro": p_micro,   "p_macro": p_macro,
@@ -238,6 +435,89 @@ def test(testloader, milnet, criterion, epoch, args, threshold: float = 0.5):
         "roc_auc_macro": roc_macro, "mAP_macro": ap_macro
     }
     return total_loss / len(testloader), results
+
+# def test(testloader, milnet, criterion, epoch, args, threshold: float = 0.5):
+#     milnet.eval()
+#     total_loss = 0.0
+#     all_labels = []
+#     all_probs  = []
+#     sum_bag = 0.0
+#     sum_inst = 0.0
+#     sum_ortho = 0.0
+#     sum_smooth = 0.0
+#     sum_total = 0.0
+#     n = 0
+#     with torch.no_grad():
+#         for batch_id, (feats, label) in enumerate(testloader):
+#             bag_feats = feats.cuda()
+#             bag_label = label.cuda()
+#             if args.model == 'AmbiguousMIL':
+#                 bag_prediction, instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = milnet(bag_feats)
+#             else:
+#                 bag_prediction = milnet(bag_feats)
+#                 instance_pred = None
+#             bag_loss = criterion(bag_prediction, bag_label)
+#             inst_loss = 0.0
+#             ortho_loss = torch.tensor(0.0, device=bag_feats.device)
+#             smooth_loss = torch.tensor(0.0, device=bag_feats.device)
+#             if instance_pred is not None:
+#                 p_inst = torch.sigmoid(instance_pred)
+#                 eps = 1e-6
+#                 p_bag_from_inst = 1 - torch.prod(torch.clamp(1 - p_inst, min=eps), dim=1)
+#                 inst_loss = F.binary_cross_entropy(p_bag_from_inst, bag_label.float())
+#                 ortho_loss = class_token_orthogonality_loss(x_cls)
+#                 smooth_loss = temporal_similarity_smooth_loss(x_seq)
+#             if args.model == 'AmbiguousMIL':
+#                 loss = args.bag_loss_w*bag_loss + args.inst_loss_w*inst_loss + args.ortho_loss_w*ortho_loss + args.smooth_loss_w*smooth_loss
+#                 sys.stdout.write('\r Testing bag [%d/%d] bag loss: %.4f  total loss: %.4f' %
+#                                  (batch_id, len(testloader), bag_loss.item(), loss.item()))
+#             else:
+#                 loss = bag_loss
+#                 sys.stdout.write('\r Testing bag [%d/%d] bag loss: %.4f  total loss: %.4f' %
+#                                  (batch_id, len(testloader), bag_loss.item(), loss.item()))
+#             total_loss += loss.item()
+#             probs = torch.sigmoid(bag_prediction).cpu().numpy()
+#             all_probs.append(probs)
+#             all_labels.append(label.cpu().numpy())
+#             sum_bag += bag_loss.item()
+#             sum_inst += float(inst_loss) if isinstance(inst_loss, float) else inst_loss.item()
+#             sum_ortho += ortho_loss.item()
+#             sum_smooth += smooth_loss.item()
+#             sum_total += loss.item()
+#             n += 1
+#     y_true = np.vstack(all_labels)
+#     y_prob = np.vstack(all_probs)
+#     y_pred = (y_prob >= threshold).astype(np.int32)
+#     f1_micro = f1_score(y_true, y_pred, average='micro', zero_division=0)
+#     f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+#     p_micro  = precision_score(y_true, y_pred, average='micro', zero_division=0)
+#     p_macro  = precision_score(y_true, y_pred, average='macro', zero_division=0)
+#     r_micro  = recall_score(y_true, y_pred, average='micro', zero_division=0)
+#     r_macro  = recall_score(y_true, y_pred, average='macro', zero_division=0)
+#     roc_list, ap_list = [], []
+#     for c in range(y_true.shape[1]):
+#         if len(np.unique(y_true[:, c])) == 2:
+#             try:
+#                 roc_list.append(roc_auc_score(y_true[:, c], y_prob[:, c]))
+#                 ap_list.append(average_precision_score(y_true[:, c], y_prob[:, c]))
+#             except Exception:
+#                 pass
+#     roc_macro = float(np.mean(roc_list)) if roc_list else 0.0
+#     ap_macro  = float(np.mean(ap_list))  if ap_list  else 0.0
+#     wandb.log({
+#         "val/bag_loss": sum_bag / max(1, n),
+#         "val/inst_loss": sum_inst / max(1, n),
+#         "val/ortho_loss": sum_ortho / max(1, n),
+#         "val/smooth_loss": sum_smooth / max(1, n),
+#         "val/total_loss": sum_total / max(1, n),
+#     }, step=epoch)
+#     results = {
+#         "f1_micro": f1_micro, "f1_macro": f1_macro,
+#         "p_micro": p_micro,   "p_macro": p_macro,
+#         "r_micro": r_micro,   "r_macro": r_macro,
+#         "roc_auc_macro": roc_macro, "mAP_macro": ap_macro
+#     }
+#     return total_loss / len(testloader), results
 
 
 def main():
@@ -285,10 +565,11 @@ def main():
     logging_path = os.path.join(args.save_dir, 'Train_log.log')
     logger = get_logger(logging_path)
 
-    args.bag_loss_w = 1
-    args.inst_loss_w = 0
-    args.ortho_loss_w = 0
-    args.smooth_loss_w = 0
+    args.bag_loss_w = 0.7
+    args.inst_loss_w = 0.2
+    args.ortho_loss_w = 0.1
+    args.smooth_loss_w = 0.02
+    args.sparsity_loss_w = 0.02
 
     option = vars(args)
     file_name = os.path.join(args.save_dir, 'option.txt')
@@ -341,18 +622,30 @@ def main():
         mix_probs = {'orig': 0.4, 2: 0.4, 3: 0.2}
         SYN_TOTAL_LEN = seq_len
 
-        trainset = MixedSyntheticBags(
+        # trainset = MixedSyntheticBags(
+        #     X=Xtr, y_idx=ytr_idx, num_classes=num_classes,
+        #     total_bags=max(2000, len(Xtr)),
+        #     probs=mix_probs, total_len=SYN_TOTAL_LEN,
+        #     min_seg_len=32, ensure_distinct_classes=True, seed=args.seed
+        # )
+
+        # testset = MixedSyntheticBags(
+        #     X=Xte, y_idx=yte_idx, num_classes=num_classes,
+        #     total_bags=max(1000, len(Xte)),
+        #     probs=mix_probs, total_len=SYN_TOTAL_LEN,
+        #     min_seg_len=32, ensure_distinct_classes=True, seed=args.seed+1
+        # )
+
+        trainset = MixedSyntheticBagsConcatK(
             X=Xtr, y_idx=ytr_idx, num_classes=num_classes,
-            total_bags=max(2000, len(Xtr)),
-            probs=mix_probs, total_len=SYN_TOTAL_LEN,
-            min_seg_len=32, ensure_distinct_classes=True, seed=args.seed
+            total_bags=len(Xtr),
+            seed=args.seed
         )
 
-        testset = MixedSyntheticBags(
+        testset = MixedSyntheticBagsConcatK(
             X=Xte, y_idx=yte_idx, num_classes=num_classes,
-            total_bags=max(1000, len(Xte)),
-            probs=mix_probs, total_len=SYN_TOTAL_LEN,
-            min_seg_len=32, ensure_distinct_classes=True, seed=args.seed+1
+            total_bags=len(Xte),
+            seed=args.seed+1
         )
 
         args.feats_size = L_in
@@ -377,18 +670,18 @@ def main():
         optimizer = torch.optim.Adam(milnet.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         optimizer =Lookahead(optimizer, alpha=0.5, k=5) 
     
-    if args.dataset in ['ArticularyWordRecognition','BasicMotions','Cricket','ERing','HandMovementDirection','LSST','PhonemeSpectra','RacketSports','SelfRegulationSCP1','SelfRegulationSCP2','UWaveGestureLibrary']:
-        batch = 64
-    elif args.dataset in ['AtrialFibrillation','FingerMovements','Handwriting','Heartbeat','MotorImagery']:
-        batch = 32
-    elif args.dataset in ['DuckDuckGeese','EthanolConcentration','NATOPS','JapaneseVowels']:
-        batch = 16
-    elif args.dataset in ['Epilepsy','FaceDetection','Libras','PEMS-SF', 'StandWalkJump']:
+    if args.dataset in ['ArticularyWordRecognition','BasicMotions','Cricket','ERing','EigenWorms','HandMovementDirection','LSST','PhonemeSpectra','RacketSports','UWaveGestureLibrary']:
         batch = 8
-    elif args.dataset in ['StandWalkJump']:
+    elif args.dataset in ['FingerMovements','Handwriting','Heartbeat']:
+        batch = 4
+    elif args.dataset in ['DuckDuckGeese','EthanolConcentration','NATOPS','JapaneseVowels','MotorImagery','SelfRegulationSCP1','SelfRegulationSCP2']:
+        batch = 2
+    elif args.dataset in ['Epilepsy','FaceDetection','Libras','PEMS-SF', 'StandWalkJump']:
+        batch = 1
+    elif args.dataset in ['StandWalkJump','AtrialFibrillation']:
         batch = 1
     elif args.dataset in ['PenDigits']:
-        batch = 128
+        batch = 16
     else:
         batch = args.batchsize
 
