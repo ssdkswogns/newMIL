@@ -197,8 +197,8 @@ class Attention(nn.Module):
         out = attn @ v                      # (B,H,N,D)
 
         out = out.transpose(1, 2).reshape(B, N, C)  # (B,N,C)
-        out = self.proj(out)
-        out = self.proj_drop(out)
+        # out = self.proj(out)
+        # out = self.proj_drop(out)
 
         if return_attn:
             return out, attn
