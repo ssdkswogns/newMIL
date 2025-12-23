@@ -1291,18 +1291,18 @@ def main():
         optimizer = torch.optim.Adam(milnet.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         optimizer =Lookahead(optimizer, alpha=0.5, k=5) 
     
-    if args.dataset in ['FingerMovements','BasicMotions','Cricket','ERing','EigenWorms','HandMovementDirection','LSST','PhonemeSpectra','RacketSports','UWaveGestureLibrary']:
-        batch = 8
+    if args.dataset in ['FingerMovements','BasicMotions','ERing','EigenWorms','HandMovementDirection','LSST','PhonemeSpectra','RacketSports','UWaveGestureLibrary']:
+        batch = 32
     elif args.dataset in ['Handwriting','Heartbeat']:
-        batch = 4
-    elif args.dataset in ['DuckDuckGeese','EthanolConcentration','NATOPS','JapaneseVowels','MotorImagery','SelfRegulationSCP1','SelfRegulationSCP2']:
-        batch = 2
-    elif args.dataset in ['Epilepsy','FaceDetection','Libras','PEMS-SF', 'StandWalkJump']:
-        batch = 1
-    elif args.dataset in ['StandWalkJump','AtrialFibrillation']:
-        batch = 1
-    elif args.dataset in ['PenDigits','ArticularyWordRecognition',]:
         batch = 16
+    elif args.dataset in ['DuckDuckGeese','EthanolConcentration','NATOPS','JapaneseVowels','MotorImagery','SelfRegulationSCP1','SelfRegulationSCP2','Cricket']:
+        batch = 8
+    elif args.dataset in ['Epilepsy','FaceDetection','Libras','PEMS-SF', 'StandWalkJump']:
+        batch = 4
+    elif args.dataset in ['StandWalkJump','AtrialFibrillation']:
+        batch = 4
+    elif args.dataset in ['PenDigits','ArticularyWordRecognition',]:
+        batch = 32
     else:
         batch = args.batchsize
 

@@ -21,19 +21,34 @@ import logging
 
 
 def make_dirs(save_dir):
-    existing_versions = os.listdir(save_dir)
-        
-    if len(existing_versions) > 0:
-        max_version = int(existing_versions[0].split("_")[-1])
-        for v in existing_versions:
-            ver = int(v.split("_")[-1])
-            if ver > max_version:
-                    max_version = ver
-        version = int(max_version) + 1
+    # 상위 디렉토리는 미리 만들어 둠
+    os.makedirs(save_dir, exist_ok=True)
+
+    versions = []
+
+    for name in os.listdir(save_dir):
+        full_path = os.path.join(save_dir, name)
+        if not os.path.isdir(full_path):
+            continue
+        if not name.startswith("exp_"):
+            continue
+        try:
+            ver = int(name.split("_")[-1])
+        except ValueError:
+            continue
+
+        versions.append(ver)
+
+    if len(versions) > 0:
+        version = max(versions) + 1
     else:
         version = 0
 
-    return f"{save_dir}/exp_{version}"
+    exp_path = os.path.join(save_dir, f"exp_{version}")
+    # 이미 같은 이름이 있으면 오류 -> 논리 버그 잡는 용도
+    os.makedirs(exp_path, exist_ok=False)
+
+    return exp_path
 
 
 def get_logger(filename, verbosity=1, name=None):
