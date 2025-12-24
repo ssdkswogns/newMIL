@@ -17,6 +17,7 @@ from utils import *
 from mydataload import loadorean
 
 from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
+from models.milet import MILLET
 
 warnings.filterwarnings("ignore")
 
@@ -135,14 +136,29 @@ def compute_classwise_aopcr(
             if not isinstance(out, (tuple, list)):
                 raise ValueError("AmbiguousMIL output must be a tuple/list")
             logits, instance_logits, x_cls, x_seq, _c_seq, attn_layer1, attn_layer2 = out
+            interpretation = None
         elif args.model == 'TimeMIL':
             out = milnet(x)
             logits, attn_layer1, attn_layer2 = out
             instance_logits = None
+            interpretation = None
         elif args.model == 'newTimeMIL':
             out = milnet(x)
             logits, x_cls, attn_layer1, attn_layer2 = out
             instance_logits = None
+            interpretation = None
+        elif args.model == 'MILLET':
+            out = milnet(x)
+            instance_logits = None
+            interpretation = None
+            if isinstance(out, (tuple, list)):
+                logits = out[0]
+                if len(out) > 1:
+                    instance_logits = out[1]
+                if len(out) > 2:
+                    interpretation = out[2]
+            else:
+                logits = out
         else:
             raise ValueError(f"Unknown model name: {args.model}")
 
@@ -168,11 +184,9 @@ def compute_classwise_aopcr(
 
                 # ----- timestep 중요도 score 계산 -----
                 if args.model == 'AmbiguousMIL' and instance_logits is not None:
-                    # instance_logits: [B, T, C] -> softmax 후 target class prob 사용
                     s_all = torch.softmax(instance_logits[b], dim=-1)   # [T, C]
                     scores = s_all[:, pred_c]                           # [T]
-                else:
-                    # TimeMIL / newTimeMIL: class-token → time-token attention 기반
+                elif args.model in ['TimeMIL', 'newTimeMIL']:
                     scores = extract_attn_importance(
                         attn_layer2=attn_layer2,
                         T=T,
@@ -180,7 +194,16 @@ def compute_classwise_aopcr(
                         target_c=pred_c,
                         model_name=args.model,
                         args=args
-                    )[b]                                                # [T]
+                    )[b]
+                elif args.model == 'MILLET':
+                    if interpretation is not None:
+                        scores = interpretation[b, pred_c]
+                    elif instance_logits is not None:
+                        scores = torch.softmax(instance_logits[b], dim=-1)[:, pred_c]
+                    else:
+                        raise ValueError("MILLET needs interpretation or instance logits for AOPCR")
+                else:
+                    raise ValueError(f"Unknown model name during score extraction: {args.model}")
 
                 scores = scores.detach()
 

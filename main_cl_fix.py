@@ -36,6 +36,7 @@ from lookhead import Lookahead
 import warnings
 
 from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
+from models.milet import MILLET
 from compute_aopcr import compute_classwise_aopcr
 
 from os.path import join
@@ -384,10 +385,16 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                 )
         else:
             if epoch < args.epoch_des:
-                bag_prediction = milnet(bag_feats, warmup=True)
-                instance_pred = None
+                out = milnet(bag_feats, warmup=True)
             else:
-                bag_prediction = milnet(bag_feats, warmup=False)
+                out = milnet(bag_feats, warmup=False)
+
+            if isinstance(out, (tuple, list)):
+                bag_prediction = out[0]
+                # MILLET may return instance predictions for interpretability; they are not used in the loss here.
+                instance_pred = out[1] if args.model == 'MILLET' and len(out) > 1 else None
+            else:
+                bag_prediction = out
                 instance_pred = None
 
         # bag-level loss
@@ -546,6 +553,16 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 if isinstance(out, (tuple, list)):
                     bag_prediction = out[0]
                     attn_layer2 = out[2]
+                else:
+                    bag_prediction = out
+            elif args.model == 'MILLET':
+                out = milnet(bag_feats)
+                instance_pred = None
+                attn_layer2 = None
+                if isinstance(out, (tuple, list)):
+                    bag_prediction = out[0]
+                    if len(out) > 1:
+                        instance_pred = out[1]
                 else:
                     bag_prediction = out
             else:
@@ -747,8 +764,11 @@ def main():
     parser.add_argument('--weight_decay', default=1e-4, type=float, help='Weight decay 1e-4]')
     parser.add_argument('--dropout_patch', default=0.5, type=float, help='Patch dropout rate [0] 0.5')
     parser.add_argument('--dropout_node', default=0.2, type=float, help='Bag classifier dropout rate [0]')
+    parser.add_argument('--millet_pooling', default='conjunctive', type=str,
+                        help="Pooling for MILLET (conjunctive | attention | instance | additive | gap)")
     parser.add_argument('--seed', default=0, type=int, help='random seed')
-    parser.add_argument('--model', default='TimeMIL', type=str, help='MIL model')
+    parser.add_argument('--model', default='TimeMIL', type=str,
+                        help='MIL model (TimeMIL | newTimeMIL | AmbiguousMIL | MILLET)')
     parser.add_argument('--prepared_npz', type=str, default='./data/PAMAP2.npz', help='전처리 결과 npz 경로 (예: ./data/PAMAP2.npz)')
     parser.add_argument('--optimizer', default='adamw', type=str, help='adamw sgd')
 
@@ -815,7 +835,7 @@ def main():
     version_name = os.path.basename(exp_path)
 
     if is_main:
-        print(f'Running TimeMIL on dataset: {args.dataset}')
+        print(f'Running {args.model} on dataset: {args.dataset}')
         wandb.init(project="TimeMIL", name=f"{args.dataset}_{args.model}_{version_name}", config=vars(args))
         wandb.define_metric("epoch")
         wandb.define_metric("train/*", step_metric="epoch")
@@ -923,6 +943,11 @@ def main():
             device=device,
             momentum=0.9,
         )
+    elif args.model == 'MILLET':
+        base_model = MILLET(args.feats_size, mDim=args.embed, n_classes=num_classes,
+                            dropout=args.dropout_node, max_seq_len=seq_len,
+                            pooling=args.millet_pooling, is_instance=False).to(device)
+        proto_bank = None
     else:
         raise Exception("Model not available")
 
@@ -1181,6 +1206,10 @@ def main():
         elif args.model == 'AmbiguousMIL':
             eval_model = AmbiguousMILwithCL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
                                             dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
+        elif args.model == 'MILLET':
+            eval_model = MILLET(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
+                                dropout=args.dropout_node, max_seq_len=args.seq_len,
+                                pooling=args.millet_pooling, is_instance=True).to(device)
         else:
             eval_model = None
 
