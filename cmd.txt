@@ -1,0 +1,12 @@
+export AEON_DATA_HOME=$HOME/.aeon/datasets
+python main_cl_fix.py \
+  --dataset ArticularyWordRecognition \
+  --datatype mixed \
+  --model MILLET \
+  --millet_pooling conjunctive \
+  --embed 128 \
+  --dropout_node 0.1 \
+  --dropout_patch 0 \
+  --num_epochs 1500 \
+  --lr 5e-3 \
+  --seed 42

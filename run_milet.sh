@@ -31,12 +31,7 @@ DATASETS=(
 )
 
 # 반복 실행
-# for dataset in "${DATASETS[@]}"; do
-#     echo "Running TimeMIL on dataset: $dataset"
-#     python main.py --dataset "$dataset" --model TimeMIL
-# done
-
 for dataset in "${DATASETS[@]}"; do
     echo "Running TimeMIL on dataset: $dataset"
-    torchrun --nproc_per_node=2 main_cl_fix.py --dataset $dataset --model newTimeMIL --datatype mixed
+    python main_cl_fix.py --dataset "$dataset" --model MILLET  --millet_pooling conjunctive   --embed 128  --dropout_node 0.1  --dropout_patch 0  --num_epochs 1500  --lr 5e-3 --datatype mixed
 done

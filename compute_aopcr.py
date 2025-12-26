@@ -136,29 +136,16 @@ def compute_classwise_aopcr(
             if not isinstance(out, (tuple, list)):
                 raise ValueError("AmbiguousMIL output must be a tuple/list")
             logits, instance_logits, x_cls, x_seq, _c_seq, attn_layer1, attn_layer2 = out
-            interpretation = None
         elif args.model == 'TimeMIL':
             out = milnet(x)
             logits, attn_layer1, attn_layer2 = out
             instance_logits = None
-            interpretation = None
         elif args.model == 'newTimeMIL':
             out = milnet(x)
             logits, x_cls, attn_layer1, attn_layer2 = out
             instance_logits = None
-            interpretation = None
         elif args.model == 'MILLET':
-            out = milnet(x)
-            instance_logits = None
-            interpretation = None
-            if isinstance(out, (tuple, list)):
-                logits = out[0]
-                if len(out) > 1:
-                    instance_logits = out[1]
-                if len(out) > 2:
-                    interpretation = out[2]
-            else:
-                logits = out
+            logits, non_weighted_instance_logit, instance_logits = milnet(x)
         else:
             raise ValueError(f"Unknown model name: {args.model}")
 
@@ -196,12 +183,8 @@ def compute_classwise_aopcr(
                         args=args
                     )[b]
                 elif args.model == 'MILLET':
-                    if interpretation is not None:
-                        scores = interpretation[b, pred_c]
-                    elif instance_logits is not None:
-                        scores = torch.softmax(instance_logits[b], dim=-1)[:, pred_c]
-                    else:
-                        raise ValueError("MILLET needs interpretation or instance logits for AOPCR")
+                    if instance_logits is not None: # [B, C, T]
+                        scores = torch.softmax(instance_logits[b], dim=1)[pred_c,:]  # [T]
                 else:
                     raise ValueError(f"Unknown model name during score extraction: {args.model}")
 

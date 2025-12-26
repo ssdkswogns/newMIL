@@ -363,16 +363,8 @@ class MILLET(nn.Module):
         bag_logits = pool_out["bag_logits"]  # [B, C]
         instance_logits = pool_out.get("instance_logits", None)  # [B, C, T]
         interpretation = pool_out.get("interpretation", None)  # [B, C, T] or [B, C, ?]
-        attn = pool_out.get("attn", None)
 
         if self.is_instance:
-            x_seq = features.transpose(1, 2)  # [B, T, mDim]
-            x_cls = x_seq.mean(dim=1, keepdim=True).expand(-1, self.n_classes, -1)  # [B, C, mDim]
-            instance_pred = instance_logits.transpose(1, 2) if instance_logits is not None else None
-            # Return tuple length 7 for compatibility with main_cl_fix.py
-            return bag_logits, instance_pred, x_cls, x_seq, interpretation, attn, attn
-
-        if instance_logits is not None or interpretation is not None:
             instance_pred = instance_logits.transpose(1, 2) if instance_logits is not None else None
             return bag_logits, instance_pred, interpretation
 

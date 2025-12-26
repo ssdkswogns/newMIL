@@ -364,6 +364,8 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
     for batch_id, (feats, label) in enumerate(trainloader):
         bag_feats = feats.to(device)
         bag_label = label.to(device)   # [B, C] multi-hot
+        x_cls = None
+        x_seq = None
 
         if args.dropout_patch > 0:
             selecy_window_indx = random.sample(range(10), int(args.dropout_patch * 10))
@@ -373,8 +375,9 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
 
         optimizer.zero_grad()
 
-        # forward
-        if args.model == 'AmbiguousMIL':
+        if args.model == 'MILLET':
+            bag_prediction, non_weighted_instance_pred, instance_pred = milnet(bag_feats)
+        elif args.model == 'AmbiguousMIL':
             if epoch < args.epoch_des:
                 bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(
                     bag_feats, warmup=True
@@ -388,11 +391,12 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                 out = milnet(bag_feats, warmup=True)
             else:
                 out = milnet(bag_feats, warmup=False)
-
+        
+        
             if isinstance(out, (tuple, list)):
                 bag_prediction = out[0]
-                # MILLET may return instance predictions for interpretability; they are not used in the loss here.
-                instance_pred = out[1] if args.model == 'MILLET' and len(out) > 1 else None
+                # MILLET는 bag_loss만 사용하지만 eval을 위해 instance_pred를 유지
+                instance_pred = out[1] if len(out) > 1 else None
             else:
                 bag_prediction = out
                 instance_pred = None
@@ -408,7 +412,7 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         proto_inst_loss = torch.tensor(0.0, device=device)
         cls_contrast_loss = torch.tensor(0.0, device=device)
 
-        if instance_pred is not None:
+        if args.model == 'AmbiguousMIL':
             # ---------- 기존 MIL 부분 ----------
             p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
             eps = 1e-6
@@ -419,7 +423,10 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                 p_bag_from_inst, bag_label.float()
             )
 
-            ortho_loss = class_token_orthogonality_loss(x_cls)
+            if x_cls is not None:
+                ortho_loss = class_token_orthogonality_loss(x_cls)
+            else:
+                ortho_loss = torch.tensor(0.0, device=device)
 
             pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
 
@@ -448,7 +455,12 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                     win=getattr(args, "proto_win", 5),
                 )
 
-                cls_contrast_loss = batch_class_embedding_contrastive_loss(x_cls, bag_label, tau=getattr(args, "cls_contrast_tau", 0.1))
+            if x_cls is not None:
+                cls_contrast_loss = batch_class_embedding_contrastive_loss(
+                    x_cls, bag_label, tau=getattr(args, "cls_contrast_tau", 0.1)
+                )
+            else:
+                cls_contrast_loss = torch.tensor(0.0, device=device)
 
         # 최종 loss
         if args.model == 'AmbiguousMIL':
@@ -534,6 +546,8 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             
             bag_feats = feats.to(device)
             bag_label = label.to(device)   # [B, C]
+            x_cls = None
+            x_seq = None
 
             if args.model == 'AmbiguousMIL':
                 bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(bag_feats)
@@ -556,15 +570,8 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 else:
                     bag_prediction = out
             elif args.model == 'MILLET':
-                out = milnet(bag_feats)
-                instance_pred = None
+                bag_prediction, non_weighted_instance_pred, instance_pred = milnet(bag_feats)
                 attn_layer2 = None
-                if isinstance(out, (tuple, list)):
-                    bag_prediction = out[0]
-                    if len(out) > 1:
-                        instance_pred = out[1]
-                else:
-                    bag_prediction = out
             else:
                 raise ValueError(f"Unknown model name: {args.model}")
 
@@ -578,7 +585,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             proto_inst_loss = torch.tensor(0.0, device=device)
             cls_contrast_loss = torch.tensor(0.0, device=device)
 
-            if instance_pred is not None:
+            if args.model == 'AmbiguousMIL':
                 # instance → bag MIL loss
                 p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
                 eps = 1e-6
@@ -590,7 +597,10 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 )
 
                 # class token orthogonality
-                ortho_loss = class_token_orthogonality_loss(x_cls)
+                if x_cls is not None:
+                    ortho_loss = class_token_orthogonality_loss(x_cls)
+                else:
+                    ortho_loss = torch.tensor(0.0, device=device)
 
                 # 이번 배치에서 실제로 등장한 positive class만 선택
                 pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
@@ -622,31 +632,38 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                     )
 
                 # batch 내 class embedding contrastive loss (proto_bank 사용 X)
-                cls_contrast_loss = batch_class_embedding_contrastive_loss(x_cls, bag_label, tau=getattr(args, "cls_contrast_tau", 0.1))
+                if x_cls is not None:
+                    cls_contrast_loss = batch_class_embedding_contrastive_loss(
+                        x_cls, bag_label, tau=getattr(args, "cls_contrast_tau", 0.1)
+                    )
+                else:
+                    cls_contrast_loss = torch.tensor(0.0, device=device)
 
-                if args.datatype == "mixed" and (y_inst is not None):
-                    # y_inst: [B, T, C] one-hot instance labels
-                    # CPU에 있어도 되지만, 일단 계산 편의를 위해 device로 올림
-                    y_inst = y_inst.to(device)
-                    # timestep별 정답 클래스 인덱스
-                    y_inst_label = torch.argmax(y_inst, dim=2)  # [B, T]
+            if args.datatype == "mixed" and (y_inst is not None):
+                # y_inst: [B, T, C] one-hot instance labels
+                # CPU에 있어도 되지만, 일단 계산 편의를 위해 device로 올림
+                y_inst = y_inst.to(device)
+                # timestep별 정답 클래스 인덱스
+                y_inst_label = torch.argmax(y_inst, dim=2)  # [B, T]
 
-                    # AmbiguousMIL인 경우 instance_pred에서 직접 argmax
-                    if args.model == 'AmbiguousMIL':
-                        pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
-                    elif args.model == 'newTimeMIL' and attn_layer2 is not None:
-                        B, T, C = y_inst.shape
-                        attn_cls = attn_layer2[:,:,:C,C:]
-                        attn_mean = attn_cls.mean(dim=1)
-                        pred_inst = torch.argmax(attn_mean, dim=1).cpu()
-                    else:
-                        pred_inst = None
+                # AmbiguousMIL인 경우 instance_pred에서 직접 argmax
+                if args.model == 'AmbiguousMIL':
+                    pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
+                elif args.model == 'MILLET':
+                    pred_inst = torch.argmax(instance_pred, dim=1)  # [B, T]
+                elif args.model == 'newTimeMIL' and attn_layer2 is not None:
+                    B, T, C = y_inst.shape
+                    attn_cls = attn_layer2[:,:,:C,C:]
+                    attn_mean = attn_cls.mean(dim=1)
+                    pred_inst = torch.argmax(attn_mean, dim=1).cpu()
+                else:
+                    pred_inst = None
 
-                    if pred_inst is not None:
-                        correct = (pred_inst == y_inst_label).sum().item()
-                        count   = y_inst_label.numel()
-                        inst_total_correct += correct
-                        inst_total_count   += count
+                if pred_inst is not None:
+                    correct = (pred_inst == y_inst_label).sum().item()
+                    count   = y_inst_label.numel()
+                    inst_total_correct += correct
+                    inst_total_count   += count
 
             if args.model == 'AmbiguousMIL':
                 loss = (
@@ -886,8 +903,25 @@ def main():
         if is_main:
             print(f'num class:{args.num_classes}')
     else:
-        Xtr, ytr, meta = load_classification(name=args.dataset, split='train',extract_path='./data')
-        Xte, yte, _   = load_classification(name=args.dataset, split='test',extract_path='./data')
+        def _load_split_with_meta(name: str, split: str, extract_path: str):
+            """Wrapper to always return (X, y, meta) even if aeon returns only (X, y)."""
+            res = load_classification(
+                name=name,
+                split=split,
+                extract_path=extract_path,
+                return_metadata=True,
+            )
+            if isinstance(res, tuple):
+                if len(res) == 3:
+                    return res
+                if len(res) == 2:
+                    X, y = res
+                    meta = {"class_values": list(dict.fromkeys(y))}
+                    return X, y, meta
+            raise ValueError(f"Unexpected return from load_classification for {name} ({split}): {type(res)} len={len(res) if hasattr(res,'__len__') else 'na'}")
+
+        Xtr, ytr, meta = _load_split_with_meta(name=args.dataset, split='train', extract_path='./data')
+        Xte, yte, _   = _load_split_with_meta(name=args.dataset, split='test',  extract_path='./data')
 
         word_to_idx = {cls:i for i, cls in enumerate(meta['class_values'])}
         ytr_idx = torch.tensor([word_to_idx[i] for i in ytr], dtype=torch.long)
@@ -946,7 +980,7 @@ def main():
     elif args.model == 'MILLET':
         base_model = MILLET(args.feats_size, mDim=args.embed, n_classes=num_classes,
                             dropout=args.dropout_node, max_seq_len=seq_len,
-                            pooling=args.millet_pooling, is_instance=False).to(device)
+                            pooling=args.millet_pooling, is_instance=True).to(device)
         proto_bank = None
     else:
         raise Exception("Model not available")
