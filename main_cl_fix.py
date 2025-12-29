@@ -35,7 +35,7 @@ import wandb
 from lookhead import Lookahead
 import warnings
 
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
+from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMIL_v2, AmbiguousMILwithCL
 from models.milet import MILLET
 from compute_aopcr import compute_classwise_aopcr
 
@@ -377,22 +377,24 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
 
         if args.model == 'MILLET':
             bag_prediction, non_weighted_instance_pred, instance_pred = milnet(bag_feats)
-        elif args.model == 'AmbiguousMIL':
+        elif args.model in ('AmbiguousMIL', 'AmbiguousMIL_v2'):
             if epoch < args.epoch_des:
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(
-                    bag_feats, warmup=True
-                )
+                out = milnet(bag_feats, warmup=True)
             else:
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(
-                    bag_feats, warmup=False
-                )
+                out = milnet(bag_feats, warmup=False)
+
+            if args.model == 'AmbiguousMIL':
+                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = out
+            else:
+                # v2 returns bag, instance, cls, seq, attn1, attn2, inst_attn
+                bag_prediction, instance_pred, x_cls, x_seq, attn_layer1, attn_layer2, inst_attn = out
+                c_seq = None
         else:
             if epoch < args.epoch_des:
                 out = milnet(bag_feats, warmup=True)
             else:
                 out = milnet(bag_feats, warmup=False)
-        
-        
+
             if isinstance(out, (tuple, list)):
                 bag_prediction = out[0]
                 # MILLET는 bag_loss만 사용하지만 eval을 위해 instance_pred를 유지
@@ -412,7 +414,7 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         proto_inst_loss = torch.tensor(0.0, device=device)
         cls_contrast_loss = torch.tensor(0.0, device=device)
 
-        if args.model == 'AmbiguousMIL':
+        if args.model in ('AmbiguousMIL', 'AmbiguousMIL_v2'):
             # ---------- 기존 MIL 부분 ----------
             p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
             eps = 1e-6
@@ -549,8 +551,13 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             x_cls = None
             x_seq = None
 
-            if args.model == 'AmbiguousMIL':
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(bag_feats)
+            if args.model in ('AmbiguousMIL', 'AmbiguousMIL_v2'):
+                out = milnet(bag_feats)
+                if args.model == 'AmbiguousMIL':
+                    bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = out
+                else:
+                    bag_prediction, instance_pred, x_cls, x_seq, attn_layer1, attn_layer2, inst_attn = out
+                    c_seq = None
             elif args.model == 'newTimeMIL':
                 out = milnet(bag_feats)
                 instance_pred = None
@@ -585,7 +592,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             proto_inst_loss = torch.tensor(0.0, device=device)
             cls_contrast_loss = torch.tensor(0.0, device=device)
 
-            if args.model == 'AmbiguousMIL':
+            if args.model in ('AmbiguousMIL', 'AmbiguousMIL_v2'):
                 # instance → bag MIL loss
                 p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
                 eps = 1e-6
@@ -647,7 +654,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 y_inst_label = torch.argmax(y_inst, dim=2)  # [B, T]
 
                 # AmbiguousMIL인 경우 instance_pred에서 직접 argmax
-                if args.model == 'AmbiguousMIL':
+                if args.model in ('AmbiguousMIL', 'AmbiguousMIL_v2'):
                     pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
                 elif args.model == 'MILLET':
                     pred_inst = torch.argmax(instance_pred, dim=1)  # [B, T]
@@ -785,7 +792,7 @@ def main():
                         help="Pooling for MILLET (conjunctive | attention | instance | additive | gap)")
     parser.add_argument('--seed', default=0, type=int, help='random seed')
     parser.add_argument('--model', default='TimeMIL', type=str,
-                        help='MIL model (TimeMIL | newTimeMIL | AmbiguousMIL | MILLET)')
+                        help='MIL model (TimeMIL | newTimeMIL | AmbiguousMIL | AmbiguousMIL_v2 | MILLET)')
     parser.add_argument('--prepared_npz', type=str, default='./data/PAMAP2.npz', help='전처리 결과 npz 경로 (예: ./data/PAMAP2.npz)')
     parser.add_argument('--optimizer', default='adamw', type=str, help='adamw sgd')
 
@@ -971,6 +978,15 @@ def main():
         proto_bank = None
     elif args.model == 'AmbiguousMIL':
         base_model = AmbiguousMILwithCL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len, is_instance=True).to(device)
+        proto_bank = PrototypeBank(
+            num_classes=num_classes,
+            dim=args.embed,
+            device=device,
+            momentum=0.9,
+        )
+    elif args.model == 'AmbiguousMIL_v2':
+        base_model = AmbiguousMIL_v2(args.feats_size, mDim=args.embed, n_classes=num_classes,
+                                     dropout=args.dropout_node, max_seq_len=seq_len, is_instance=True).to(device)
         proto_bank = PrototypeBank(
             num_classes=num_classes,
             dim=args.embed,
@@ -1240,6 +1256,9 @@ def main():
         elif args.model == 'AmbiguousMIL':
             eval_model = AmbiguousMILwithCL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
                                             dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
+        elif args.model == 'AmbiguousMIL_v2':
+            eval_model = AmbiguousMIL_v2(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
+                                         dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
         elif args.model == 'MILLET':
             eval_model = MILLET(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
                                 dropout=args.dropout_node, max_seq_len=args.seq_len,

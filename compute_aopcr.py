@@ -183,8 +183,12 @@ def compute_classwise_aopcr(
                         args=args
                     )[b]
                 elif args.model == 'MILLET':
-                    if instance_logits is not None: # [B, C, T]
-                        scores = torch.softmax(instance_logits[b], dim=1)[pred_c,:]  # [T]
+                    # if instance_logits is not None: # [B, C, T]
+                    #     scores = instance_logits[b, pred_c, :]
+                    #     scores = torch.softmax(instance_logits[b], dim=1)[pred_c,:]  # [T]
+                    if non_weighted_instance_logit is not None: # [B, T, C]
+                        scores = non_weighted_instance_logit[b, :, pred_c]
+                        # scores = torch.softmax(non_weighted_instance_logit[b], dim=1)[:,pred_c]  # [T]
                 else:
                     raise ValueError(f"Unknown model name during score extraction: {args.model}")
 

@@ -29,9 +29,13 @@ DATASETS=(
   "UWaveGestureLibrary"
   # "JapaneseVowels"
 )
-
 # 반복 실행
+# for dataset in "${DATASETS[@]}"; do
+#     echo "Running TimeMIL on dataset: $dataset"
+#     python main.py --dataset "$dataset" --model TimeMIL
+# done
+
 for dataset in "${DATASETS[@]}"; do
-    echo "Running TimeMIL on dataset: $dataset"
-    python main_cl_fix.py --dataset "$dataset" --model MILLET  --millet_pooling conjunctive   --embed 128  --dropout_node 0.1  --dropout_patch 0  --num_epochs 1500  --lr 5e-3 --datatype original
+  echo "Running TimeMIL on dataset: $dataset"
+  python main_cl_fix.py --dataset $dataset --model AmbiguousMIL --datatype mixed --bag_loss_w 0.15 --inst_loss_w 0.35 --proto_loss_w 0.5 --epoch_des 20 --num_epochs 1500 --embed 64
 done

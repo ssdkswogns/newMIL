@@ -29,7 +29,6 @@ DATASETS=(
   "UWaveGestureLibrary"
   # "JapaneseVowels"
 )
-
 # 반복 실행
 # for dataset in "${DATASETS[@]}"; do
 #     echo "Running TimeMIL on dataset: $dataset"
@@ -37,6 +36,6 @@ DATASETS=(
 # done
 
 for dataset in "${DATASETS[@]}"; do
-    echo "Running TimeMIL on dataset: $dataset"
-    CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 --master_port=29600 main_cl_fix.py --dataset $dataset --model AmbiguousMIL --datatype mixed --bag_loss_w 0.3 --inst_loss_w 0.1 --ortho_loss_w 0.0 --smooth_loss_w 0.05 --sparsity_loss_w 0.05 --proto_loss_w 0.5
+  echo "Running TimeMIL on dataset: $dataset"
+  python main_cl_fix.py --dataset $dataset --model AmbiguousMIL --datatype mixed --bag_loss_w 0.15 --inst_loss_w 0.35 --proto_loss_w 0.5 --epoch_des 20 --num_epochs 1500 --embed 128
 done

@@ -29,6 +29,7 @@ from utils import *
 from mydataload import loadorean
 from models.timemil import TimeMIL, newTimeMIL, AmbiguousMILwithCL
 from compute_aopcr import compute_classwise_aopcr
+from models.milet import MILLET
 
 warnings.filterwarnings("ignore")
 
@@ -65,11 +66,19 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
                     raise ValueError("Unexpected AmbiguousMIL output")
                 logits, instance_pred = out[0], out[1]
                 attn_layer2 = out[-1]
-            else:
+            elif args.model in ['TimeMIL', 'newTimeMIL']:
                 if not isinstance(out, (tuple, list)) or len(out) < 4:
                     raise ValueError("Unexpected model output")
                 logits, _, _, attn_layer2 = out
                 instance_pred = None
+            elif args.model == 'MILLET':
+                if not isinstance(out, (tuple, list)) or len(out) < 3:
+                    raise ValueError("Unexpected MILLET output")
+                # MILLET returns (bag_logits, instance_logits[B,T,C], interpretation[B,C,T])
+                logits, non_weighted_instance_pred, instance_pred = out
+                attn_layer2 = None
+            else:
+                raise ValueError(f"Unknown model {args.model}")
 
             loss = criterion(logits, bag_label)
             total_loss += loss.item()
@@ -79,13 +88,19 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
             all_labels.append(label.cpu().numpy())
 
             _, _, C = y_inst.shape
-            attn_cls = attn_layer2[:, :, :C, C:]
-            attn_mean = attn_cls.mean(dim=1)
-
-            if args.model == 'AmbiguousMIL' and instance_pred is not None:
-                pred_inst = torch.argmax(instance_pred, dim=2).cpu()
+            if args.model == 'MILLET' and instance_pred is not None:
+                # MILLET interpretation map is [B, C, T]; follow main_cl_fix behavior
+                pred_inst = torch.argmax(non_weighted_instance_pred, dim=2).cpu()
             else:
-                pred_inst = torch.argmax(attn_mean, dim=1).cpu()
+                if attn_layer2 is None:
+                    raise ValueError("Attention output is required for instance prediction")
+                attn_cls = attn_layer2[:, :, :C, C:]
+                attn_mean = attn_cls.mean(dim=1)
+
+                if args.model == 'AmbiguousMIL' and instance_pred is not None:
+                    pred_inst = torch.argmax(instance_pred, dim=2).cpu()
+                else:
+                    pred_inst = torch.argmax(attn_mean, dim=1).cpu()
 
             y_inst_label = torch.argmax(y_inst, dim=2).cpu()
 
@@ -160,6 +175,26 @@ def build_datasets(args):
     Mirrors the logic from compute_aopcr and instance_val_cl to build train/test sets.
     Returns (testset, class_names, seq_len, num_classes, feat_dim)
     """
+    def _load_split_with_meta(name: str, split: str, extract_path: str):
+        """aeon load_classification wrapper that always returns (X, y, meta)."""
+        res = load_classification(
+            name=name,
+            split=split,
+            extract_path=extract_path,
+            return_metadata=True,
+        )
+        if isinstance(res, tuple):
+            if len(res) == 3:
+                return res
+            if len(res) == 2:
+                X, y = res
+                meta = {"class_values": list(dict.fromkeys(y))}
+                return X, y, meta
+        raise ValueError(
+            f"Unexpected return from load_classification for {name} ({split}): "
+            f"{type(res)} len={len(res) if hasattr(res,'__len__') else 'na'}"
+        )
+
     if args.dataset in ['JapaneseVowels', 'SpokenArabicDigits', 'CharacterTrajectories', 'InsectWingbeat']:
         trainset = loadorean(args, split='train')
         testset = loadorean(args, split='test')
@@ -174,8 +209,8 @@ def build_datasets(args):
             class_names = [str(i) for i in range(num_classes)]
         return testset, class_names, seq_len, num_classes, L_in
 
-    Xtr, ytr, meta = load_classification(name=args.dataset, split='train', extract_path='./data')
-    Xte, yte, _ = load_classification(name=args.dataset, split='test', extract_path='./data')
+    Xtr, ytr, meta = _load_split_with_meta(name=args.dataset, split='train', extract_path='./data')
+    Xte, yte, _ = _load_split_with_meta(name=args.dataset, split='test', extract_path='./data')
 
     Xtr = torch.from_numpy(Xtr).permute(0, 2, 1).float()  # [N,T,D]
     Xte = torch.from_numpy(Xte).permute(0, 2, 1).float()
@@ -223,7 +258,14 @@ def build_model(args, seq_len, num_classes, device):
         milnet = AmbiguousMILwithCL(args.feats_size, mDim=args.embed,
                                     n_classes=num_classes,
                                     dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-                                    max_seq_len=seq_len, is_instance=True).to(device)
+                         max_seq_len=seq_len, is_instance=True).to(device)
+    elif args.model == 'MILLET':
+        milnet = MILLET(args.feats_size, mDim=args.embed,
+                        n_classes=num_classes,
+                        dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
+                        max_seq_len=seq_len,
+                        pooling=getattr(args, "millet_pooling", "conjunctive"),
+                        is_instance=True).to(device)
     else:
         raise Exception("Model not available")
     return milnet
@@ -237,13 +279,15 @@ def main():
     parser.add_argument('--feats_size', default=512, type=int, help='Dimension of the feature size')
     parser.add_argument('--gpu_index', type=int, nargs='+', default=(0,), help='GPU ID(s) [0]')
     parser.add_argument('--seed', default=0, type=int, help='random seed')
-    parser.add_argument('--model', default='newTimeMIL', type=str, help='MIL model: TimeMIL | newTimeMIL | AmbiguousMIL')
+    parser.add_argument('--model', default='newTimeMIL', type=str, help='MIL model: TimeMIL | newTimeMIL | AmbiguousMIL | MILLET')
     parser.add_argument('--model_path', default='./savemodel/InceptBackbone/BasicMotions/exp_7/weights/best_newTimeMIL.pth',
                         type=str, help='Target model path for evaluation')
     parser.add_argument('--embed', default=128, type=int, help='Number of embedding')
     parser.add_argument('--batchsize', default=64, type=int, help='batchsize')
     parser.add_argument('--num_random', default=3, type=int, help='Random baseline repetition for AOPCR')
     parser.add_argument('--dropout_node', default=0.0, type=float, help='Dropout rate for classifier heads')
+    parser.add_argument('--millet_pooling', default="conjunctive", type=str,
+                        help="MILLET pooling method: conjunctive | attention | instance | additive | gap")
     parser.add_argument('--no_fallback_to_predicted', action='store_false', dest='fallback_to_predicted',
                         help='If set, skip bags with no positive labels instead of using argmax prediction')
     parser.add_argument('--cls_threshold', default=0.5, type=float, help='Threshold for multi-label classification metrics')
@@ -267,7 +311,7 @@ def main():
 
     # DataLoader
     testloader = DataLoader(
-        testset, batch_size=16, shuffle=False,
+        testset, batch_size=args.batchsize, shuffle=False,
         num_workers=args.num_workers, drop_last=False, pin_memory=True
     )
 
@@ -287,7 +331,7 @@ def main():
 
     # AOPCR
     print("Computing class-wise AOPCR ...")
-    aopcr_c, aopcr_w_avg, aopcr_mean, M_expl, M_rand, alphas, counts = compute_classwise_aopcr(
+    aopcr_c, aopcr_w_avg, aopcr_mean, aopcr_overall, M_expl, M_rand, alphas, counts = compute_classwise_aopcr(
         milnet,
         testloader,
         args,
@@ -310,6 +354,8 @@ def main():
     print("\n===== Average AOPCR =====")
     print(f"Weighted Average AOPCR: {aopcr_w_avg:.6f}")
     print(f"Mean AOPCR: {aopcr_mean:.6f}")
+    if aopcr_overall is not None:
+        print(f"Overall AOPCR (original dataset): {aopcr_overall:.6f}")
 
 
 if __name__ == '__main__':

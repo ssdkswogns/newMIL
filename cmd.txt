@@ -10,3 +10,13 @@ python main_cl_fix.py \
   --num_epochs 1500 \
   --lr 5e-3 \
   --seed 42
+
+# 기준 option.txt와 동일한 실험만 포함 (save_dir/seed는 무시)
+python collect_aopcr.py \
+  --match-options savemodel/InceptBackbone/ArticularyWordRecognition/exp_0/option.txt \
+  --ignore-keys save_dir seed
+
+python collect_aopcr.py \
+--max-exp-id
+
+python3 move_latest_exps.py --dest ./savemodel/millet_mixed_data
