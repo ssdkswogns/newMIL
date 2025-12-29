@@ -1,2 +1,4 @@
 wandb/
 savemodel/
+data/
+*.pth
