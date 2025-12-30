@@ -27,6 +27,7 @@ from utils import *
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
 from mydataload import loadorean
+from dba_dataloader import build_dba_for_timemil
 import random
 
 import wandb
@@ -778,6 +779,12 @@ def main():
     parser.add_argument('--proto_loss_w', type=float, default=0.2, help='weight for prototype instance contrastive loss')
     parser.add_argument('--cls_contrast_tau', type=float, default=0.1, help='temperature for batch class embedding contrastive loss')
     parser.add_argument('--cls_contrast_w', type=float, default=0.0, help='weight for batch class embedding contrastive loss')
+    
+    parser.add_argument('--dba_root', type=str, default='./dba_data', help='Root directory of DBA dataset (1_xxx/aggressive/... 구조)')
+    parser.add_argument('--dba_window', type=int, default=50, help='Sliding window length (time steps) for DBA dataset')
+    parser.add_argument('--dba_stride', type=int, default=10, help='Sliding window stride for DBA dataset')
+    parser.add_argument('--dba_test_ratio', type=float, default=0.2, help='Train/Test split ratio (sequence-level) for DBA dataset')
+
     args = parser.parse_args()
 
     # ----- DDP setup -----
@@ -865,6 +872,26 @@ def main():
         args.num_classes = num_classes
         if is_main:
             print(f'num class:{args.num_classes}')
+
+    elif args.dataset == 'dba':
+        # dba는 window 단위 single-label bag이므로 original만 사용
+        if args.datatype != "original":
+            raise ValueError("DBA dataset currently supports only datatype='original'.")
+
+        if is_main:
+            print(f"[DBA] building dataset from root: {args.dba_root}")
+
+        trainset, testset, seq_len, num_classes, L_in = build_dba_for_timemil(args)
+
+        args.seq_len = seq_len
+        args.feats_size = L_in
+        args.num_classes = num_classes
+
+        if is_main:
+            print(f"[DBA] seq_len (window): {seq_len}")
+            print(f"[DBA] num_classes: {num_classes}")
+            print(f"[DBA] feat_in: {L_in}")
+    
     else:
         Xtr, ytr, meta = load_classification(name=args.dataset, split='train',extract_path='./data')
         Xte, yte, _   = load_classification(name=args.dataset, split='test',extract_path='./data')
@@ -923,6 +950,22 @@ def main():
             device=device,
             momentum=0.9,
         )
+
+        # 전체 학습 가능한 파라미터 수
+        total_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+
+        # InceptionTime feature_extractor 파라미터 수
+        fe_params = sum(p.numel() for p in base_model.feature_extractor.parameters()
+                        if p.requires_grad)
+
+        # Transformer + WPE + cls token + head들 전체 파라미터 수
+        tr_params = total_params - fe_params
+
+        print(f"Total      : {total_params:,}")
+        print(f"Backbone   : {fe_params:,}  (InceptionTime feature_extractor)")
+        print(f"Transformer: {tr_params:,}  (WPE + TransLayer + heads 등)")
+        print(f"Backbone 비율   : {fe_params / total_params * 100:.2f} %")
+        print(f"Transformer 비율: {tr_params / total_params * 100:.2f} %")
     else:
         raise Exception("Model not available")
 
