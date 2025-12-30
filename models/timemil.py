@@ -514,13 +514,14 @@ class AmbiguousMILwithCL(nn.Module):
         
         self.cls_reduce = nn.Conv1d(
             in_channels=mDim, out_channels=1, kernel_size=1, bias=True
-        )
+        ) # TODO Average pooling으로 바꿀까 고민중
+        # self.cls_reduce = nn.AdaptiveAvgPool1d(1)
 
         # instance-level head (per-timestep)
         self.instance_head = nn.Sequential(
-            nn.Linear(mDim, mDim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            # nn.Linear(mDim, mDim),
+            # nn.ReLU(),
+            # nn.Dropout(dropout),
             nn.Linear(mDim, n_classes)
         )
 
