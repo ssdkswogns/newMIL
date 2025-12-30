@@ -27,7 +27,7 @@ from utils import *
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
 from mydataload import loadorean
-from dba_dataloader import build_dba_for_timemil
+from dba_dataloader import build_dba_for_timemil, build_dba_windows_for_mixed
 import random
 
 import wandb
@@ -87,12 +87,6 @@ torch.backends.cudnn.benchmark = False
 #   PrototypeBank & Losses
 # ---------------------------------------------------------------------
 class PrototypeBank:
-    """
-    클래스별 global prototype을 유지하는 뱅크.
-    - prototypes: [C, D]
-    - EMA(momentum)로 업데이트
-    - 아직 한 번도 관측 안 된 클래스는 initialized[c] == False
-    """
     def __init__(self, num_classes: int, dim: int, device, momentum: float = 0.9):
         self.num_classes = num_classes
         self.dim = dim
@@ -104,11 +98,6 @@ class PrototypeBank:
 
     @torch.no_grad()
     def update(self, x_cls: torch.Tensor, bag_label: torch.Tensor):
-        """
-        x_cls: [B, C, D]
-        bag_label: [B, C] (multi-hot)
-        label[b, c] == 1 인 bag들에서 x_cls[b, c]를 평균 내고 EMA로 업데이트
-        """
         B, C, D = x_cls.shape
         assert C == self.num_classes and D == self.dim
 
@@ -127,31 +116,193 @@ class PrototypeBank:
     def get(self):
         return self.prototypes, self.initialized
 
+    @torch.no_grad()
+    def sync(self, world_size: int):
+        """
+        DDP 환경에서 모든 rank의 prototype을 평균 내고,
+        initialized는 OR로 합치는 동기화 함수.
+        """
+        if (world_size <= 1) or (not dist.is_available()) or (not dist.is_initialized()):
+            return
+
+        # 1) prototypes 평균
+        dist.all_reduce(self.prototypes, op=dist.ReduceOp.SUM)
+        self.prototypes /= float(world_size)
+
+        # 2) initialized OR
+        # bool은 바로 all_reduce가 안 되므로 float/int로 캐스팅
+        init_float = self.initialized.to(self.prototypes.dtype)  # [C]
+        dist.all_reduce(init_float, op=dist.ReduceOp.SUM)
+        self.initialized = init_float > 0.0
+
+# class PrototypeBank:
+#     """
+#     클래스별 global prototype을 유지하는 뱅크.
+#     - prototypes: [C, D]
+#     - EMA(momentum)로 업데이트
+#     - 아직 한 번도 관측 안 된 클래스는 initialized[c] == False
+#     """
+#     def __init__(self, num_classes: int, dim: int, device, momentum: float = 0.9):
+#         self.num_classes = num_classes
+#         self.dim = dim
+#         self.momentum = momentum
+#         self.device = device
+
+#         self.prototypes = torch.zeros(num_classes, dim, device=device)
+#         self.initialized = torch.zeros(num_classes, dtype=torch.bool, device=device)
+
+#     @torch.no_grad()
+#     def update(self, x_cls: torch.Tensor, bag_label: torch.Tensor):
+#         """
+#         x_cls: [B, C, D]
+#         bag_label: [B, C] (multi-hot)
+#         label[b, c] == 1 인 bag들에서 x_cls[b, c]를 평균 내고 EMA로 업데이트
+#         """
+#         B, C, D = x_cls.shape
+#         assert C == self.num_classes and D == self.dim
+
+#         for c in range(C):
+#             mask = bag_label[:, c] > 0
+#             if mask.any():
+#                 cls_c = x_cls[mask, c, :]          # [N_c, D]
+#                 proto_batch = cls_c.mean(dim=0)    # [D]
+#                 if self.initialized[c]:
+#                     m = self.momentum
+#                     self.prototypes[c] = m * self.prototypes[c] + (1.0 - m) * proto_batch
+#                 else:
+#                     self.prototypes[c] = proto_batch
+#                     self.initialized[c] = True
+
+#     def get(self):
+#         return self.prototypes, self.initialized
+
+# def instance_prototype_contrastive_loss(
+#     x_seq: torch.Tensor,        # [B, T, D]  (z_t)
+#     bag_label: torch.Tensor,    # [B, C]     (multi-hot, bag-level)
+#     proto_bank: PrototypeBank,
+#     tau: float = 0.1,
+#     sim_thresh: float = 0.7,
+#     win: int = 5,
+# ):
+#     """
+#     1) z_{b,t}가 feature space에서 어떤 class prototype과 충분히 가까우면
+#        -> 그 class를 positive
+#     2) 어떤 class와도 가까운 게 없으면 (ambiguous)
+#        -> temporal neighbor들 중에서 prototype boundary 안에 들어가는 애가 있는지 확인,
+#           있으면 그 class를 positive
+#     3) 둘 다 안 되면 anchor로 사용하지 않음.
+
+#     그 다음, anchor로 선택된 (b,t)에 대해
+#     - anchor: z_{b,t}
+#     - positive: 해당 class prototype p_c
+#     - negatives: 모든 prototype p_k
+#     로 InfoNCE 계산.
+#     """
+#     device = x_seq.device
+#     prototypes, initialized = proto_bank.get()        # [C, D], [C]
+
+#     if not initialized.any():
+#         return torch.tensor(0.0, device=device)
+
+#     B, T, D = x_seq.shape
+#     C = prototypes.shape[0]
+#     assert bag_label.shape == (B, C)
+
+#     # cosine normalize
+#     x_norm = F.normalize(x_seq, dim=-1)               # [B, T, D]
+#     p_norm = F.normalize(prototypes, dim=-1)          # [C, D]
+
+#     # similarity: S[b, t, c] = <z_{b,t}, p_c>
+#     S_full = torch.einsum('btd,cd->btc', x_norm, p_norm)  # [B, T, C]
+#     S = S_full.clone()
+
+#     # positive 후보는:
+#     #  - 해당 bag에 존재하는 class (bag_label[b, c] == 1)
+#     #  - prototype이 초기화된 class만
+#     valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B, 1, C]
+#     S_valid = S.masked_fill(~valid_class_mask, -1e9)   # positive 후보가 아닌 class는 -inf 취급
+
+#     anchors_b = []
+#     anchors_t = []
+#     anchors_c = []
+#     anchor_conf = []
+
+#     for b in range(B):
+#         for t in range(T):
+#             sims_bt = S_valid[b, t]        # [C], invalid는 -1e9
+#             max_sim, c_star = sims_bt.max(dim=-1)
+
+#             if max_sim >= sim_thresh:
+#                 # 규칙 1: 직접 prototype 근처
+#                 anchors_b.append(b)
+#                 anchors_t.append(t)
+#                 anchors_c.append(c_star)
+#             else:
+#                 # 규칙 2: ambiguous -> temporal neighbor 찾아보기
+#                 t_min = max(0, t - win)
+#                 t_max = min(T - 1, t + win)
+#                 if t_min == t_max:
+#                     continue
+
+#                 sims_neighbors = S_valid[b, t_min:t_max+1]      # [L, C]
+#                 max_sim_nei, c_nei = sims_neighbors.max(dim=-1)  # [L], [L]
+
+#                 # 이웃들 중 최댓값과 그 class
+#                 max_sim_neighbor, idx_nei = max_sim_nei.max(dim=0)
+#                 c_best = c_nei[idx_nei]
+
+#                 if max_sim_neighbor >= sim_thresh:
+#                     anchors_b.append(b)
+#                     anchors_t.append(t)
+#                     anchors_c.append(c_best)
+#                     anchor_conf.append(max_sim_neighbor.item())
+
+#     # ★ 루프 전체가 끝난 뒤에 anchor 존재 여부 체크
+#     if len(anchors_b) == 0:
+#         return torch.tensor(0.0, device=device)
+
+#     b_idx = torch.tensor(anchors_b, device=device, dtype=torch.long)
+#     t_idx = torch.tensor(anchors_t, device=device, dtype=torch.long)
+#     c_idx = torch.tensor(anchors_c, device=device, dtype=torch.long)
+#     N = b_idx.size(0)
+
+#     # anchor feature: z_anchor = z_{b,t}
+#     z_anchor = x_norm[b_idx, t_idx, :]      # [N, D]
+
+#     # prototype 전체와 similarity (negatives까지 포함)
+#     sim_all = torch.matmul(z_anchor, p_norm.t()) / tau   # [N, C]
+#     pos_sim = sim_all[torch.arange(N, device=device), c_idx]  # [N]
+#     log_all = torch.logsumexp(sim_all, dim=-1)                # [N]
+#     base = pos_sim - log_all                                  # [N]
+
+#     # --- class-balanced weighting ---
+#     with torch.no_grad():
+#         counts = torch.bincount(c_idx, minlength=C).float()   # [C]
+#         weights_per_class = torch.zeros(C, device=device)
+#         valid = counts > 0
+#         weights_per_class[valid] = counts.sum() / counts[valid]
+
+#     w = weights_per_class[c_idx]   # [N]
+#     loss = -(base * w).sum() / (w.sum() + 1e-6)
+#     return loss
 
 def instance_prototype_contrastive_loss(
-    x_seq: torch.Tensor,        # [B, T, D]  (z_t)
-    bag_label: torch.Tensor,    # [B, C]     (multi-hot, bag-level)
+    x_seq: torch.Tensor,        # [B, T, D]
+    bag_label: torch.Tensor,    # [B, C]
     proto_bank: PrototypeBank,
     tau: float = 0.1,
     sim_thresh: float = 0.7,
     win: int = 5,
 ):
     """
-    1) z_{b,t}가 feature space에서 어떤 class prototype과 충분히 가까우면
-       -> 그 class를 positive
-    2) 어떤 class와도 가까운 게 없으면 (ambiguous)
-       -> temporal neighbor들 중에서 prototype boundary 안에 들어가는 애가 있는지 확인,
-          있으면 그 class를 positive
-    3) 둘 다 안 되면 anchor로 사용하지 않음.
-
-    그 다음, anchor로 선택된 (b,t)에 대해
-    - anchor: z_{b,t}
-    - positive: 해당 class prototype p_c
-    - negatives: 모든 prototype p_k
-    로 InfoNCE 계산.
+    벡터화 버전:
+      1) S_valid[b,t,c] = <z_{b,t}, p_c> (bag에 존재 + proto init된 class만)
+      2) direct non-ambiguous: max_c S_valid[b,t,c] >= sim_thresh
+      3) ambiguous: direct 실패 시, [t-win,t+win] 내에서
+         max_{t'} max_c S_valid[b,t',c] >= sim_thresh 이면 그 (t',c)를 positive로 사용
     """
     device = x_seq.device
-    prototypes, initialized = proto_bank.get()        # [C, D], [C]
+    prototypes, initialized = proto_bank.get()  # [C,D], [C]
 
     if not initialized.any():
         return torch.tensor(0.0, device=device)
@@ -160,74 +311,70 @@ def instance_prototype_contrastive_loss(
     C = prototypes.shape[0]
     assert bag_label.shape == (B, C)
 
-    # cosine normalize
-    x_norm = F.normalize(x_seq, dim=-1)               # [B, T, D]
-    p_norm = F.normalize(prototypes, dim=-1)          # [C, D]
+    # 1. cosine normalize
+    x_norm = F.normalize(x_seq, dim=-1)     # [B,T,D]
+    p_norm = F.normalize(prototypes, dim=-1)   # [C,D]
 
-    # similarity: S[b, t, c] = <z_{b,t}, p_c>
-    S_full = torch.einsum('btd,cd->btc', x_norm, p_norm)  # [B, T, C]
-    S = S_full.clone()
+    # 2. similarity S[b,t,c]
+    S_full = torch.einsum('btd,cd->btc', x_norm, p_norm)  # [B,T,C]
+    S_valid = S_full.clone()
 
-    # positive 후보는:
-    #  - 해당 bag에 존재하는 class (bag_label[b, c] == 1)
-    #  - prototype이 초기화된 class만
-    valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B, 1, C]
-    S_valid = S.masked_fill(~valid_class_mask, -1e9)   # positive 후보가 아닌 class는 -inf 취급
+    # valid class: bag_label=1 AND prototype initialized
+    valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B,1,C]
+    S_valid = S_valid.masked_fill(~valid_class_mask, -1e9)
 
-    anchors_b = []
-    anchors_t = []
-    anchors_c = []
-    anchor_conf = []
+    # 3. direct non-ambiguous: per (b,t)에서 class 최대
+    S_tmax, c_argmax = S_valid.max(dim=-1)  # [B,T], [B,T]
+    direct_pos_mask = (S_tmax >= sim_thresh)  # [B,T]
 
-    for b in range(B):
-        for t in range(T):
-            sims_bt = S_valid[b, t]        # [C], invalid는 -1e9
-            max_sim, c_star = sims_bt.max(dim=-1)
+    # 4. temporal neighbor-based ambiguous matching (sliding window max over time)
+    if win > 0:
+        # padding 후 unfold로 윈도우 생성: [B,T,2*win+1]
+        S_padded = F.pad(S_tmax, (win, win), value=-1e9)
+        windows = S_padded.unfold(dimension=1, size=2 * win + 1, step=1)  # [B,T,2*win+1]
 
-            if max_sim >= sim_thresh:
-                # 규칙 1: 직접 prototype 근처
-                anchors_b.append(b)
-                anchors_t.append(t)
-                anchors_c.append(c_star)
-            else:
-                # 규칙 2: ambiguous -> temporal neighbor 찾아보기
-                t_min = max(0, t - win)
-                t_max = min(T - 1, t + win)
-                if t_min == t_max:
-                    continue
+        nei_max, idx_in_win = windows.max(dim=-1)  # [B,T], [B,T]
+        neighbor_pos_mask = (~direct_pos_mask) & (nei_max >= sim_thresh)
 
-                sims_neighbors = S_valid[b, t_min:t_max+1]      # [L, C]
-                max_sim_nei, c_nei = sims_neighbors.max(dim=-1)  # [L], [L]
+        # neighbor 시점 t' 계산
+        t_arange = torch.arange(T, device=device).view(1, T)  # [1,T]
+        neighbor_t = t_arange - win + idx_in_win              # [B,T]
+        neighbor_t = neighbor_t.clamp(0, T - 1)
 
-                # 이웃들 중 최댓값과 그 class
-                max_sim_neighbor, idx_nei = max_sim_nei.max(dim=0)
-                c_best = c_nei[idx_nei]
+        # neighbor 시점에서의 best class
+        c_nei = c_argmax.gather(1, neighbor_t)  # [B,T]
+    else:
+        nei_max = torch.full_like(S_tmax, -1e9)
+        neighbor_pos_mask = torch.zeros_like(S_tmax, dtype=torch.bool)
+        c_nei = torch.zeros_like(c_argmax)
 
-                if max_sim_neighbor >= sim_thresh:
-                    anchors_b.append(b)
-                    anchors_t.append(t)
-                    anchors_c.append(c_best)
-                    anchor_conf.append(max_sim_neighbor.item())
-
-    # ★ 루프 전체가 끝난 뒤에 anchor 존재 여부 체크
-    if len(anchors_b) == 0:
+    # 5. 최종 anchor mask 및 class 선택
+    anchors_mask = direct_pos_mask | neighbor_pos_mask  # [B,T]
+    if not anchors_mask.any():
         return torch.tensor(0.0, device=device)
 
-    b_idx = torch.tensor(anchors_b, device=device, dtype=torch.long)
-    t_idx = torch.tensor(anchors_t, device=device, dtype=torch.long)
-    c_idx = torch.tensor(anchors_c, device=device, dtype=torch.long)
+    # 각 위치별 최종 class index (direct vs neighbor 중 선택)
+    c_all = torch.where(direct_pos_mask, c_argmax, c_nei)  # [B,T]
+
+    # (b,t,c) 인덱스를 1D 텐서로 뽑기
+    b_idx_full = torch.arange(B, device=device).view(B, 1).expand(B, T)  # [B,T]
+    t_idx_full = torch.arange(T, device=device).view(1, T).expand(B, T)  # [B,T]
+
+    b_idx = b_idx_full[anchors_mask]  # [N]
+    t_idx = t_idx_full[anchors_mask]  # [N]
+    c_idx = c_all[anchors_mask]       # [N]
     N = b_idx.size(0)
 
-    # anchor feature: z_anchor = z_{b,t}
-    z_anchor = x_norm[b_idx, t_idx, :]      # [N, D]
+    # 6. InfoNCE 계산
+    z_anchor = x_norm[b_idx, t_idx, :]      # [N,D]
 
-    # prototype 전체와 similarity (negatives까지 포함)
-    sim_all = torch.matmul(z_anchor, p_norm.t()) / tau   # [N, C]
+    # anchor vs all prototypes
+    sim_all = torch.matmul(z_anchor, p_norm.t()) / tau   # [N,C]
     pos_sim = sim_all[torch.arange(N, device=device), c_idx]  # [N]
-    log_all = torch.logsumexp(sim_all, dim=-1)                # [N]
-    base = pos_sim - log_all                                  # [N]
+    log_all = torch.logsumexp(sim_all, dim=-1)                 # [N]
+    base = pos_sim - log_all                                   # [N]
 
-    # --- class-balanced weighting ---
+    # class-balanced weighting (그대로 유지)
     with torch.no_grad():
         counts = torch.bincount(c_idx, minlength=C).float()   # [C]
         weights_per_class = torch.zeros(C, device=device)
@@ -238,116 +385,12 @@ def instance_prototype_contrastive_loss(
     loss = -(base * w).sum() / (w.sum() + 1e-6)
     return loss
 
-def batch_class_embedding_contrastive_loss(
-    x_cls: torch.Tensor,     # [B, C, D]
-    bag_label: torch.Tensor, # [B, C] (multi-hot)
-    tau: float = 0.1,
-):
-    """
-    한 batch 안의 class embedding(x_cls[b, c])에 대해
-    - bag_label[b, c] == 1 인 위치만 anchor 후보로 사용
-    - 같은 class index(c)가 label인 embedding들끼리는 positive
-    - 다른 class index는 negative
-    로 InfoNCE 형태의 loss를 계산.
-
-    x_cls는 이미 class token 임베딩(또는 class embedding)으로 가정.
-    """
-    device = x_cls.device
-    B, C, D = x_cls.shape
-    assert bag_label.shape == (B, C)
-
-    # bag에서 실제로 1인 class 위치만 사용
-    # idx: [N, 2]  (batch_idx, class_idx)
-    pos_idx = (bag_label > 0).nonzero(as_tuple=False)
-    if pos_idx.size(0) < 2:
-        # 같은 class를 공유하는 샘플이 없으면 contrastive 신호가 없음
-        return torch.tensor(0.0, device=device)
-
-    N = pos_idx.size(0)
-    b_idx = pos_idx[:, 0]
-    c_idx = pos_idx[:, 1]
-
-    # 해당 위치의 class embedding만 모음: [N, D]
-    x_norm = F.normalize(x_cls, dim=-1)      # [B, C, D]
-    feats  = x_norm[b_idx, c_idx, :]         # [N, D]
-
-    # class label은 class index 자체를 사용
-    labels = c_idx                           # [N]
-
-    # pairwise similarity: [N, N]
-    sim = torch.matmul(feats, feats.t()) / tau
-
-    # self-sim은 제외
-    eye = torch.eye(N, device=device, dtype=torch.bool)
-    sim = sim.masked_fill(eye, -1e9)
-
-    # 같은 class이면 positive, 다른 class이면 negative
-    same_class = labels.unsqueeze(0) == labels.unsqueeze(1)   # [N, N]
-    pos_mask   = same_class & (~eye)                          # 자기 자신 제외한 same-class
-    neg_mask   = ~same_class                                  # 다른 class
-
-    # anchor별로 positive가 최소 1개 이상인 경우만 사용
-    pos_any = pos_mask.any(dim=1)   # [N]
-    if pos_any.sum() == 0:
-        return torch.tensor(0.0, device=device)
-
-    # exp(sim) 계산
-    exp_sim = torch.exp(sim)  # [N, N]
-
-    # 각 anchor i에 대해:
-    #   numerator = sum_{j in P(i)} exp(sim_ij)
-    #   denom     = sum_{j != i}    exp(sim_ij)
-    pos_exp = exp_sim * pos_mask
-    all_exp = exp_sim.clone()  # (self는 이미 -1e9 -> 0으로 됨)
-
-    pos_sum = pos_exp.sum(dim=1)           # [N]
-    denom   = all_exp.sum(dim=1) + 1e-8    # [N]
-
-    # positive가 없는 anchor는 제외
-    pos_sum = pos_sum[pos_any]
-    denom   = denom[pos_any]
-
-    log_prob = torch.log(pos_sum / denom)  # [N_valid]
-    loss = -log_prob.mean()
-    return loss
-
-def temporal_similarity_smooth_loss(x_seq):
-    """
-    x_seq : (B, L, D)
-    """
-    B, L, D = x_seq.shape
-    x_norm = F.normalize(x_seq, dim=-1)                 # (B, L, D)
-    S = torch.matmul(x_norm, x_norm.transpose(1, 2))    # (B, L, L)
-
-    grad_x = S[:, :, 1:] - S[:, :, :-1]                 # (B, L, L-1)
-    grad_y = S[:, 1:, :] - S[:, :-1, :]                 # (B, L-1, L)
-
-    loss = grad_x.abs().mean() + grad_y.abs().mean()
-    return loss
-
-def class_token_orthogonality_loss(x_cls, diag_weight=1.0, offdiag_weight=1.0, eps=1e-6):
-    B, C, D = x_cls.shape
-    x_norm = F.normalize(x_cls, dim=-1)
-    S = torch.matmul(x_norm, x_norm.transpose(1, 2))          # (B, C, C)
-
-    I = torch.eye(C, device=x_cls.device).unsqueeze(0).expand(B, C, C)
-
-    diag = S.diagonal(dim1=1, dim2=2)                         # (B, C)
-    diag_loss = ((diag - 1.0) ** 2).mean() if diag_weight > 0 else 0.0
-
-    off_mask = ~torch.eye(C, dtype=torch.bool, device=x_cls.device).unsqueeze(0).expand(B, C, C)
-    off = (S - I).masked_select(off_mask)
-    offdiag_loss = (off ** 2).mean() if offdiag_weight > 0 else 0.0
-
-    return diag_weight * diag_loss + offdiag_weight * offdiag_loss
-
-
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, average_precision_score
 
 # ---------------------------------------------------------------------
 #   Train / Test (DDP-aware)
 # ---------------------------------------------------------------------
-def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=None, is_main=True):
+def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=None, is_main=True, world_size=1):
     milnet.train()
     total_loss = 0
     sum_bag = 0.0
@@ -362,6 +405,8 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
     n = 0
 
     for batch_id, (feats, label) in enumerate(trainloader):
+        print(feats)
+        print(label)
         bag_feats = feats.to(device)
         bag_label = label.to(device)   # [B, C] multi-hot
 
@@ -404,35 +449,39 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
 
         if instance_pred is not None:
             # ---------- 기존 MIL 부분 ----------
-            p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
-            eps = 1e-6
-            p_bag_from_inst = 1 - torch.prod(
-                torch.clamp(1 - p_inst, min=eps), dim=1
-            )                                           # [B, C]
-            inst_loss = F.binary_cross_entropy(
-                p_bag_from_inst, bag_label.float()
-            )
+            # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
+            # eps = 1e-6
+            # p_bag_from_inst = 1 - torch.prod(
+            #     torch.clamp(1 - p_inst, min=eps), dim=1
+            # )                                           # [B, C]
+            # inst_loss = F.binary_cross_entropy(
+            #     p_bag_from_inst, bag_label.float()
+            # )
+            p_inst = instance_pred.mean(dim=1)       # [B, C]
+            inst_loss = criterion(p_inst, bag_label)
 
-            ortho_loss = class_token_orthogonality_loss(x_cls)
+            # ortho_loss = class_token_orthogonality_loss(x_cls)
 
-            pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+            # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
 
-            sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
-            if pos_mask.sum() > 0:
-                sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
-                    pos_mask.sum() + 1e-6
-                )
-            else:
-                sparsity_loss = torch.tensor(0.0, device=device)
-            sparsity_loss = sparsity_per_class.mean()
+            # sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
+            # if pos_mask.sum() > 0:
+            #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
+            #         pos_mask.sum() + 1e-6
+            #     )
+            # else:
+            #     sparsity_loss = torch.tensor(0.0, device=device)
+            # sparsity_loss = sparsity_per_class.mean()
 
-            diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
-            diff = diff * pos_mask[None, None, :]
-            smooth_loss = (diff ** 2).mean()
+            # diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
+            # diff = diff * pos_mask[None, None, :]
+            # smooth_loss = (diff ** 2).mean()
 
             # ---------- prototype 기반 instance CL ----------
             if (epoch >= args.epoch_des) and (proto_bank is not None):
                 proto_bank.update(x_cls.detach(), bag_label)
+                if world_size > 1:
+                    proto_bank.sync(world_size)
                 proto_inst_loss = instance_prototype_contrastive_loss(
                     x_seq,
                     bag_label,
@@ -442,18 +491,16 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                     win=getattr(args, "proto_win", 5),
                 )
 
-                cls_contrast_loss = batch_class_embedding_contrastive_loss(x_cls, bag_label, tau=getattr(args, "cls_contrast_tau", 0.1))
-
         # 최종 loss
         if args.model == 'AmbiguousMIL':
             loss = (
                 args.bag_loss_w * bag_loss
                 + args.inst_loss_w * inst_loss
-                + args.ortho_loss_w * ortho_loss
-                + args.smooth_loss_w * smooth_loss
-                + args.sparsity_loss_w * sparsity_loss
+                # + args.ortho_loss_w * ortho_loss
+                # + args.smooth_loss_w * smooth_loss
+                # + args.sparsity_loss_w * sparsity_loss
                 + args.proto_loss_w * proto_inst_loss
-                + args.cls_contrast_w * cls_contrast_loss
+                # + args.cls_contrast_w * cls_contrast_loss
             )
         else:
             loss = bag_loss
@@ -472,11 +519,11 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         total_loss += bag_loss.item()
         sum_bag += bag_loss.item()
         sum_inst += float(inst_loss) if isinstance(inst_loss, float) else float(inst_loss)
-        sum_ortho += ortho_loss.item()
-        sum_smooth += smooth_loss.item()
-        sum_sparsity += sparsity_loss.item()
+        # sum_ortho += ortho_loss.item()
+        # sum_smooth += smooth_loss.item()
+        # sum_sparsity += sparsity_loss.item()
         sum_proto_inst += proto_inst_loss.item()
-        sum_cls_contrast += cls_contrast_loss.item()
+        # sum_cls_contrast += cls_contrast_loss.item()
         sum_total += loss.item()
         n += 1
 
@@ -485,12 +532,12 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             "epoch": epoch,
             "train/bag_loss": sum_bag / max(1, n),
             "train/inst_loss": sum_inst / max(1, n),
-            "train/ortho_loss": sum_ortho / max(1, n),
-            "train/smooth_loss": sum_smooth / max(1, n),
-            "train/sparsity_loss": sum_sparsity / max(1, n),
-            "train/ctx_contrast_loss": sum_ctx_contrast / max(1, n),
+            # "train/ortho_loss": sum_ortho / max(1, n),
+            # "train/smooth_loss": sum_smooth / max(1, n),
+            # "train/sparsity_loss": sum_sparsity / max(1, n),
+            # "train/ctx_contrast_loss": sum_ctx_contrast / max(1, n),
             "train/proto_inst_loss": sum_proto_inst / max(1, n),
-            "train/cls_contrast_loss": sum_cls_contrast / max(1, n),
+            # "train/cls_contrast_loss": sum_cls_contrast / max(1, n),
             "train/total_loss": sum_total / max(1, n),
         }, step=epoch)
 
@@ -498,7 +545,11 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
 
 
 def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 0.5, proto_bank=None, is_main=True):
-    milnet.eval()
+    if isinstance(milnet, nn.parallel.DistributedDataParallel):
+        model = milnet.module
+    else:
+        model = milnet
+    model.eval()
     total_loss = 0.0
     all_labels = []
     all_probs  = []
@@ -530,9 +581,9 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             bag_label = label.to(device)   # [B, C]
 
             if args.model == 'AmbiguousMIL':
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(bag_feats)
+                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = model(bag_feats)
             elif args.model == 'newTimeMIL':
-                out = milnet(bag_feats)
+                out = model(bag_feats)
                 instance_pred = None
                 attn_layer2 = None
                 if isinstance(out, (tuple, list)):
@@ -541,7 +592,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 else:
                     bag_prediction = out
             elif args.model == 'TimeMIL':
-                out = milnet(bag_feats)
+                out = model(bag_feats)
                 instance_pred = None
                 attn_layer2 = None
                 if isinstance(out, (tuple, list)):
@@ -556,43 +607,46 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             bag_loss = criterion(bag_prediction, bag_label)
 
             inst_loss = 0.0
-            ortho_loss = torch.tensor(0.0, device=device)
-            smooth_loss = torch.tensor(0.0, device=device)
-            sparsity_loss = torch.tensor(0.0, device=device)
+            # ortho_loss = torch.tensor(0.0, device=device)
+            # smooth_loss = torch.tensor(0.0, device=device)
+            # sparsity_loss = torch.tensor(0.0, device=device)
             proto_inst_loss = torch.tensor(0.0, device=device)
-            cls_contrast_loss = torch.tensor(0.0, device=device)
+            # cls_contrast_loss = torch.tensor(0.0, device=device)
 
             if instance_pred is not None:
-                # instance → bag MIL loss
-                p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
-                eps = 1e-6
-                p_bag_from_inst = 1 - torch.prod(
-                    torch.clamp(1 - p_inst, min=eps), dim=1
-                )                                           # [B, C]
-                inst_loss = F.binary_cross_entropy(
-                    p_bag_from_inst, bag_label.float()
-                )
+                # # instance → bag MIL loss
+                # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
+                # eps = 1e-6
+                # p_bag_from_inst = 1 - torch.prod(
+                #     torch.clamp(1 - p_inst, min=eps), dim=1
+                # )                                           # [B, C]
+                # inst_loss = F.binary_cross_entropy(
+                #     p_bag_from_inst, bag_label.float()
+                # )
 
-                # class token orthogonality
-                ortho_loss = class_token_orthogonality_loss(x_cls)
+                p_inst = instance_pred.mean(dim=1)       # [B, C]
+                inst_loss = criterion(p_inst, bag_label)
 
-                # 이번 배치에서 실제로 등장한 positive class만 선택
-                pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+                # # class token orthogonality
+                # ortho_loss = class_token_orthogonality_loss(x_cls)
 
-                # sparsity loss
-                sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
-                if pos_mask.sum() > 0:
-                    sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
-                        pos_mask.sum() + 1e-6
-                    )
-                else:
-                    sparsity_loss = torch.tensor(0.0, device=device)
-                sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
+                # # 이번 배치에서 실제로 등장한 positive class만 선택
+                # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
 
-                # temporal smoothness loss
-                diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
-                diff = diff * pos_mask[None, None, :]         # broadcast
-                smooth_loss = (diff ** 2).mean()
+                # # sparsity loss
+                # sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
+                # if pos_mask.sum() > 0:
+                #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
+                #         pos_mask.sum() + 1e-6
+                #     )
+                # else:
+                #     sparsity_loss = torch.tensor(0.0, device=device)
+                # sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
+
+                # # temporal smoothness loss
+                # diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
+                # diff = diff * pos_mask[None, None, :]         # broadcast
+                # smooth_loss = (diff ** 2).mean()
 
                 # prototype 기반 instance CL (eval에서는 update 없이 loss만)
                 if (epoch >= args.epoch_des) and (proto_bank is not None):
@@ -604,9 +658,6 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                         sim_thresh=getattr(args, "proto_sim_thresh", 0.7),
                         win=getattr(args, "proto_win", 5),
                     )
-
-                # batch 내 class embedding contrastive loss (proto_bank 사용 X)
-                cls_contrast_loss = batch_class_embedding_contrastive_loss(x_cls, bag_label, tau=getattr(args, "cls_contrast_tau", 0.1))
 
                 if args.datatype == "mixed" and (y_inst is not None):
                     # y_inst: [B, T, C] one-hot instance labels
@@ -636,11 +687,11 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 loss = (
                     args.bag_loss_w * bag_loss
                     + args.inst_loss_w * inst_loss
-                    + args.ortho_loss_w * ortho_loss
-                    + args.smooth_loss_w * smooth_loss
-                    + args.sparsity_loss_w * sparsity_loss
+                    # + args.ortho_loss_w * ortho_loss
+                    # + args.smooth_loss_w * smooth_loss
+                    # + args.sparsity_loss_w * sparsity_loss
                     + args.proto_loss_w * proto_inst_loss
-                    + args.cls_contrast_w * cls_contrast_loss
+                    # + args.cls_contrast_w * cls_contrast_loss
                 )
             else:
                 loss = bag_loss
@@ -652,18 +703,21 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 )
 
             total_loss += loss.item()
-
-            probs = torch.sigmoid(bag_prediction).cpu().numpy()
+            
+            if args.model == 'AmbiguousMIL':
+                probs = torch.sigmoid(p_inst).cpu().numpy() # p_inst is main output for evaluation
+            else:
+                probs = torch.sigmoid(bag_prediction).cpu().numpy()
             all_probs.append(probs)
             all_labels.append(label.cpu().numpy())
 
             sum_bag += bag_loss.item()
             sum_inst += float(inst_loss) if isinstance(inst_loss, float) else float(inst_loss)
-            sum_ortho += ortho_loss.item()
-            sum_smooth += smooth_loss.item()
-            sum_sparsity += sparsity_loss.item()
+            # sum_ortho += ortho_loss.item()
+            # sum_smooth += smooth_loss.item()
+            # sum_sparsity += sparsity_loss.item()
             sum_proto_inst += proto_inst_loss.item()
-            sum_cls_contrast += cls_contrast_loss.item()
+            # sum_cls_contrast += cls_contrast_loss.item()
             sum_total += loss.item()
             n += 1
 
@@ -706,12 +760,12 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
         log_dict = {
             "val/bag_loss": sum_bag / max(1, n),
             "val/inst_loss": sum_inst / max(1, n),
-            "val/ortho_loss": sum_ortho / max(1, n),
-            "val/smooth_loss": sum_smooth / max(1, n),
-            "val/sparsity_loss": sum_sparsity / max(1, n),
-            "val/ctx_contrast_loss": sum_ctx_contrast / max(1, n),
+            # "val/ortho_loss": sum_ortho / max(1, n),
+            # "val/smooth_loss": sum_smooth / max(1, n),
+            # "val/sparsity_loss": sum_sparsity / max(1, n),
+            # "val/ctx_contrast_loss": sum_ctx_contrast / max(1, n),
             "val/proto_inst_loss": sum_proto_inst / max(1, n),
-            "val/cls_contrast_loss": sum_cls_contrast / max(1, n),
+            # "val/cls_contrast_loss": sum_cls_contrast / max(1, n),
             "val/total_loss": sum_total / max(1, n),
         }
         if bag_acc is not None:
@@ -780,7 +834,7 @@ def main():
     parser.add_argument('--cls_contrast_tau', type=float, default=0.1, help='temperature for batch class embedding contrastive loss')
     parser.add_argument('--cls_contrast_w', type=float, default=0.0, help='weight for batch class embedding contrastive loss')
     
-    parser.add_argument('--dba_root', type=str, default='./dba_data', help='Root directory of DBA dataset (1_xxx/aggressive/... 구조)')
+    parser.add_argument('--dba_root', type=str, default='./data/dba_data', help='Root directory of DBA dataset (1_xxx/aggressive/... 구조)')
     parser.add_argument('--dba_window', type=int, default=50, help='Sliding window length (time steps) for DBA dataset')
     parser.add_argument('--dba_stride', type=int, default=10, help='Sliding window stride for DBA dataset')
     parser.add_argument('--dba_test_ratio', type=float, default=0.2, help='Train/Test split ratio (sequence-level) for DBA dataset')
@@ -874,24 +928,46 @@ def main():
             print(f'num class:{args.num_classes}')
 
     elif args.dataset == 'dba':
-        # dba는 window 단위 single-label bag이므로 original만 사용
-        if args.datatype != "original":
-            raise ValueError("DBA dataset currently supports only datatype='original'.")
+            if is_main:
+                print(f"[DBA] building dataset from root: {args.dba_root}")
 
-        if is_main:
-            print(f"[DBA] building dataset from root: {args.dba_root}")
+            if args.datatype == 'original':
+                # window 하나가 bag이 되는 기존 방식
+                trainset, testset, seq_len, num_classes, L_in = build_dba_for_timemil(args)
 
-        trainset, testset, seq_len, num_classes, L_in = build_dba_for_timemil(args)
+            elif args.datatype == 'mixed':
+                # window 단위로 잘라서 concat-bag 을 만드는 방식
+                Xtr, ytr_idx, Xte, yte_idx, seq_len, num_classes, L_in = build_dba_windows_for_mixed(args)
 
-        args.seq_len = seq_len
-        args.feats_size = L_in
-        args.num_classes = num_classes
+                trainset = MixedSyntheticBagsConcatK(
+                    X=Xtr,
+                    y_idx=ytr_idx,
+                    num_classes=num_classes,
+                    total_bags=len(Xtr),
+                    concat_k=2,
+                    seed=args.seed,
+                )
+                testset = MixedSyntheticBagsConcatK(
+                    X=Xte,
+                    y_idx=yte_idx,
+                    num_classes=num_classes,
+                    total_bags=len(Xte),
+                    concat_k=2,
+                    seed=args.seed+1,
+                    return_instance_labels=True,
+                )
+            else:
+                raise ValueError(f"Unsupported datatype '{args.datatype}' for DBA dataset")
 
-        if is_main:
-            print(f"[DBA] seq_len (window): {seq_len}")
-            print(f"[DBA] num_classes: {num_classes}")
-            print(f"[DBA] feat_in: {L_in}")
-    
+            args.seq_len = seq_len
+            args.feats_size = L_in
+            args.num_classes = num_classes
+
+            if is_main:
+                print(f"[DBA] seq_len (window): {seq_len}")
+                print(f"[DBA] num_classes: {num_classes}")
+                print(f"[DBA] feat_in: {L_in}")
+
     else:
         Xtr, ytr, meta = load_classification(name=args.dataset, split='train',extract_path='./data')
         Xte, yte, _   = load_classification(name=args.dataset, split='test',extract_path='./data')
@@ -908,7 +984,6 @@ def main():
         L_in = Xtr.shape[-1]
         seq_len = max(21, Xte.shape[1])
 
-        mix_probs = {'orig': 0.4, 2: 0.4, 3: 0.2}
         SYN_TOTAL_LEN = seq_len
 
         if args.datatype == 'mixed':
@@ -924,6 +999,7 @@ def main():
                 seed=args.seed+1,
                 return_instance_labels=True
             )
+
         elif args.datatype == 'original':
             # ★ 여기서는 한 bag에 하나의 class (원본 시퀀스)
             trainset = TensorDataset(Xtr, F.one_hot(ytr_idx, num_classes=num_classes).float())
@@ -1022,7 +1098,7 @@ def main():
         sampler=train_sampler
     )
     testloader = DataLoader(
-        testset, batch_size=batch, shuffle=False,
+        testset, batch_size=1, shuffle=False,
         num_workers=args.num_workers, drop_last=False, pin_memory=True,
         sampler=test_sampler
     )
@@ -1261,7 +1337,7 @@ def main():
 
             # AOPCR with batch_size=1 for perturbation routine
             testloader_aopcr = DataLoader(
-                testset, batch_size=batch, shuffle=False,
+                testset, batch_size=1, shuffle=False,
                 num_workers=args.num_workers, drop_last=False, pin_memory=True
             )
             print("Computing class-wise AOPCR with best model ...")
