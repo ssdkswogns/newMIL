@@ -294,7 +294,7 @@ class MILLET(nn.Module):
         self.mDim = mDim
 
         # Feature extractor (InceptionTime backbone)
-        out_channels = max(1, mDim // 4)
+        out_channels = max(1, mDim // 4) # 그냥 출력 맞춰주기 위해
         self.feature_extractor = InceptionTimeFeatureExtractor(
             n_in_channels=feats_size,
             out_channels=out_channels,

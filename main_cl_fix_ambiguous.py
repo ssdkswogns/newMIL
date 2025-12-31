@@ -87,12 +87,6 @@ torch.backends.cudnn.benchmark = False
 #   PrototypeBank & Losses
 # ---------------------------------------------------------------------
 class PrototypeBank:
-    """
-    클래스별 global prototype을 유지하는 뱅크.
-    - prototypes: [C, D]
-    - EMA(momentum)로 업데이트
-    - 아직 한 번도 관측 안 된 클래스는 initialized[c] == False
-    """
     def __init__(self, num_classes: int, dim: int, device, momentum: float = 0.9):
         self.num_classes = num_classes
         self.dim = dim
@@ -104,11 +98,6 @@ class PrototypeBank:
 
     @torch.no_grad()
     def update(self, x_cls: torch.Tensor, bag_label: torch.Tensor):
-        """
-        x_cls: [B, C, D]
-        bag_label: [B, C] (multi-hot)
-        label[b, c] == 1 인 bag들에서 x_cls[b, c]를 평균 내고 EMA로 업데이트
-        """
         B, C, D = x_cls.shape
         assert C == self.num_classes and D == self.dim
 
@@ -145,6 +134,157 @@ class PrototypeBank:
         init_float = self.initialized.to(self.prototypes.dtype)  # [C]
         dist.all_reduce(init_float, op=dist.ReduceOp.SUM)
         self.initialized = init_float > 0.0
+
+# class PrototypeBank:
+#     """
+#     클래스별 global prototype을 유지하는 뱅크.
+#     - prototypes: [C, D]
+#     - EMA(momentum)로 업데이트
+#     - 아직 한 번도 관측 안 된 클래스는 initialized[c] == False
+#     """
+#     def __init__(self, num_classes: int, dim: int, device, momentum: float = 0.9):
+#         self.num_classes = num_classes
+#         self.dim = dim
+#         self.momentum = momentum
+#         self.device = device
+
+#         self.prototypes = torch.zeros(num_classes, dim, device=device)
+#         self.initialized = torch.zeros(num_classes, dtype=torch.bool, device=device)
+
+#     @torch.no_grad()
+#     def update(self, x_cls: torch.Tensor, bag_label: torch.Tensor):
+#         """
+#         x_cls: [B, C, D]
+#         bag_label: [B, C] (multi-hot)
+#         label[b, c] == 1 인 bag들에서 x_cls[b, c]를 평균 내고 EMA로 업데이트
+#         """
+#         B, C, D = x_cls.shape
+#         assert C == self.num_classes and D == self.dim
+
+#         for c in range(C):
+#             mask = bag_label[:, c] > 0
+#             if mask.any():
+#                 cls_c = x_cls[mask, c, :]          # [N_c, D]
+#                 proto_batch = cls_c.mean(dim=0)    # [D]
+#                 if self.initialized[c]:
+#                     m = self.momentum
+#                     self.prototypes[c] = m * self.prototypes[c] + (1.0 - m) * proto_batch
+#                 else:
+#                     self.prototypes[c] = proto_batch
+#                     self.initialized[c] = True
+
+#     def get(self):
+#         return self.prototypes, self.initialized
+
+# def instance_prototype_contrastive_loss(
+#     x_seq: torch.Tensor,        # [B, T, D]  (z_t)
+#     bag_label: torch.Tensor,    # [B, C]     (multi-hot, bag-level)
+#     proto_bank: PrototypeBank,
+#     tau: float = 0.1,
+#     sim_thresh: float = 0.7,
+#     win: int = 5,
+# ):
+#     """
+#     1) z_{b,t}가 feature space에서 어떤 class prototype과 충분히 가까우면
+#        -> 그 class를 positive
+#     2) 어떤 class와도 가까운 게 없으면 (ambiguous)
+#        -> temporal neighbor들 중에서 prototype boundary 안에 들어가는 애가 있는지 확인,
+#           있으면 그 class를 positive
+#     3) 둘 다 안 되면 anchor로 사용하지 않음.
+
+#     그 다음, anchor로 선택된 (b,t)에 대해
+#     - anchor: z_{b,t}
+#     - positive: 해당 class prototype p_c
+#     - negatives: 모든 prototype p_k
+#     로 InfoNCE 계산.
+#     """
+#     device = x_seq.device
+#     prototypes, initialized = proto_bank.get()        # [C, D], [C]
+
+#     if not initialized.any():
+#         return torch.tensor(0.0, device=device)
+
+#     B, T, D = x_seq.shape
+#     C = prototypes.shape[0]
+#     assert bag_label.shape == (B, C)
+
+#     # cosine normalize
+#     x_norm = F.normalize(x_seq, dim=-1)               # [B, T, D]
+#     p_norm = F.normalize(prototypes, dim=-1)          # [C, D]
+
+#     # similarity: S[b, t, c] = <z_{b,t}, p_c>
+#     S_full = torch.einsum('btd,cd->btc', x_norm, p_norm)  # [B, T, C]
+#     S = S_full.clone()
+
+#     # positive 후보는:
+#     #  - 해당 bag에 존재하는 class (bag_label[b, c] == 1)
+#     #  - prototype이 초기화된 class만
+#     valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B, 1, C]
+#     S_valid = S.masked_fill(~valid_class_mask, -1e9)   # positive 후보가 아닌 class는 -inf 취급
+
+#     anchors_b = []
+#     anchors_t = []
+#     anchors_c = []
+#     anchor_conf = []
+
+#     for b in range(B):
+#         for t in range(T):
+#             sims_bt = S_valid[b, t]        # [C], invalid는 -1e9
+#             max_sim, c_star = sims_bt.max(dim=-1)
+
+#             if max_sim >= sim_thresh:
+#                 # 규칙 1: 직접 prototype 근처
+#                 anchors_b.append(b)
+#                 anchors_t.append(t)
+#                 anchors_c.append(c_star)
+#             else:
+#                 # 규칙 2: ambiguous -> temporal neighbor 찾아보기
+#                 t_min = max(0, t - win)
+#                 t_max = min(T - 1, t + win)
+#                 if t_min == t_max:
+#                     continue
+
+#                 sims_neighbors = S_valid[b, t_min:t_max+1]      # [L, C]
+#                 max_sim_nei, c_nei = sims_neighbors.max(dim=-1)  # [L], [L]
+
+#                 # 이웃들 중 최댓값과 그 class
+#                 max_sim_neighbor, idx_nei = max_sim_nei.max(dim=0)
+#                 c_best = c_nei[idx_nei]
+
+#                 if max_sim_neighbor >= sim_thresh:
+#                     anchors_b.append(b)
+#                     anchors_t.append(t)
+#                     anchors_c.append(c_best)
+#                     anchor_conf.append(max_sim_neighbor.item())
+
+#     # ★ 루프 전체가 끝난 뒤에 anchor 존재 여부 체크
+#     if len(anchors_b) == 0:
+#         return torch.tensor(0.0, device=device)
+
+#     b_idx = torch.tensor(anchors_b, device=device, dtype=torch.long)
+#     t_idx = torch.tensor(anchors_t, device=device, dtype=torch.long)
+#     c_idx = torch.tensor(anchors_c, device=device, dtype=torch.long)
+#     N = b_idx.size(0)
+
+#     # anchor feature: z_anchor = z_{b,t}
+#     z_anchor = x_norm[b_idx, t_idx, :]      # [N, D]
+
+#     # prototype 전체와 similarity (negatives까지 포함)
+#     sim_all = torch.matmul(z_anchor, p_norm.t()) / tau   # [N, C]
+#     pos_sim = sim_all[torch.arange(N, device=device), c_idx]  # [N]
+#     log_all = torch.logsumexp(sim_all, dim=-1)                # [N]
+#     base = pos_sim - log_all                                  # [N]
+
+#     # --- class-balanced weighting ---
+#     with torch.no_grad():
+#         counts = torch.bincount(c_idx, minlength=C).float()   # [C]
+#         weights_per_class = torch.zeros(C, device=device)
+#         valid = counts > 0
+#         weights_per_class[valid] = counts.sum() / counts[valid]
+
+#     w = weights_per_class[c_idx]   # [N]
+#     loss = -(base * w).sum() / (w.sum() + 1e-6)
+#     return loss
 
 def instance_prototype_contrastive_loss(
     x_seq: torch.Tensor,        # [B, T, D]
@@ -250,7 +390,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_sco
 # ---------------------------------------------------------------------
 #   Train / Test (DDP-aware)
 # ---------------------------------------------------------------------
-def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=None, is_main=True):
+def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=None, is_main=True, world_size=1):
     milnet.train()
     total_loss = 0
     sum_bag = 0.0
@@ -267,8 +407,6 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
     for batch_id, (feats, label) in enumerate(trainloader):
         bag_feats = feats.to(device)
         bag_label = label.to(device)   # [B, C] multi-hot
-        x_cls = None
-        x_seq = None
 
         if args.dropout_patch > 0:
             selecy_window_indx = random.sample(range(10), int(args.dropout_patch * 10))
@@ -278,8 +416,10 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
 
         optimizer.zero_grad()
 
+        # forward
         if args.model == 'MILLET':
-            bag_prediction, non_weighted_instance_pred, instance_pred = milnet(bag_feats)
+            bag_prediction, instance_pred, interpretation = milnet(bag_feats)
+            x_cls, x_seq = None, None
         elif args.model == 'AmbiguousMIL':
             if epoch < args.epoch_des:
                 bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(
@@ -308,7 +448,7 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         proto_inst_loss = torch.tensor(0.0, device=device)
         cls_contrast_loss = torch.tensor(0.0, device=device)
 
-        if args.model == 'AmbiguousMIL':
+        if instance_pred is not None:
             # ---------- 기존 MIL 부분 ----------
             # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
             # eps = 1e-6
@@ -318,30 +458,31 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             # inst_loss = F.binary_cross_entropy(
             #     p_bag_from_inst, bag_label.float()
             # )
+            p_inst = instance_pred.mean(dim=1)       # [B, C]
+            inst_loss = criterion(p_inst, bag_label)
 
-            if x_cls is not None:
-                ortho_loss = class_token_orthogonality_loss(x_cls)
-            else:
-                ortho_loss = torch.tensor(0.0, device=device)
+            # ortho_loss = class_token_orthogonality_loss(x_cls)
 
-            pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+            # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
 
-            sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
-            if pos_mask.sum() > 0:
-                sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
-                    pos_mask.sum() + 1e-6
-                )
-            else:
-                sparsity_loss = torch.tensor(0.0, device=device)
-            sparsity_loss = sparsity_per_class.mean()
+            # sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
+            # if pos_mask.sum() > 0:
+            #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
+            #         pos_mask.sum() + 1e-6
+            #     )
+            # else:
+            #     sparsity_loss = torch.tensor(0.0, device=device)
+            # sparsity_loss = sparsity_per_class.mean()
 
-            diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
-            diff = diff * pos_mask[None, None, :]
-            smooth_loss = (diff ** 2).mean()
+            # diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
+            # diff = diff * pos_mask[None, None, :]
+            # smooth_loss = (diff ** 2).mean()
 
             # ---------- prototype 기반 instance CL ----------
             if (epoch >= args.epoch_des) and (proto_bank is not None):
                 proto_bank.update(x_cls.detach(), bag_label)
+                if world_size > 1:
+                    proto_bank.sync(world_size)
                 proto_inst_loss = instance_prototype_contrastive_loss(
                     x_seq,
                     bag_label,
@@ -351,23 +492,16 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                     win=getattr(args, "proto_win", 5),
                 )
 
-            if x_cls is not None:
-                cls_contrast_loss = batch_class_embedding_contrastive_loss(
-                    x_cls, bag_label, tau=getattr(args, "cls_contrast_tau", 0.1)
-                )
-            else:
-                cls_contrast_loss = torch.tensor(0.0, device=device)
-
         # 최종 loss
         if args.model == 'AmbiguousMIL':
             loss = (
                 args.bag_loss_w * bag_loss
                 + args.inst_loss_w * inst_loss
-                + args.ortho_loss_w * ortho_loss
-                + args.smooth_loss_w * smooth_loss
-                + args.sparsity_loss_w * sparsity_loss
+                # + args.ortho_loss_w * ortho_loss
+                # + args.smooth_loss_w * smooth_loss
+                # + args.sparsity_loss_w * sparsity_loss
                 + args.proto_loss_w * proto_inst_loss
-                + args.cls_contrast_w * cls_contrast_loss
+                # + args.cls_contrast_w * cls_contrast_loss
             )
         else:
             loss = bag_loss
@@ -386,42 +520,37 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         total_loss += bag_loss.item()
         sum_bag += bag_loss.item()
         sum_inst += float(inst_loss) if isinstance(inst_loss, float) else float(inst_loss)
-        sum_ortho += ortho_loss.item()
-        sum_smooth += smooth_loss.item()
-        sum_sparsity += sparsity_loss.item()
+        # sum_ortho += ortho_loss.item()
+        # sum_smooth += smooth_loss.item()
+        # sum_sparsity += sparsity_loss.item()
         sum_proto_inst += proto_inst_loss.item()
-        sum_cls_contrast += cls_contrast_loss.item()
+        # sum_cls_contrast += cls_contrast_loss.item()
         sum_total += loss.item()
         n += 1
 
     if is_main and wandb.run is not None:
-        train_log = {
+        wandb.log({
             "epoch": epoch,
             "train/bag_loss": sum_bag / max(1, n),
+            "train/inst_loss": sum_inst / max(1, n),
+            # "train/ortho_loss": sum_ortho / max(1, n),
+            # "train/smooth_loss": sum_smooth / max(1, n),
+            # "train/sparsity_loss": sum_sparsity / max(1, n),
+            # "train/ctx_contrast_loss": sum_ctx_contrast / max(1, n),
+            "train/proto_inst_loss": sum_proto_inst / max(1, n),
+            # "train/cls_contrast_loss": sum_cls_contrast / max(1, n),
             "train/total_loss": sum_total / max(1, n),
-        }
-        if args.inst_loss_w > 0:
-            train_log["train/inst_loss"] = sum_inst / max(1, n)
-        if args.ortho_loss_w > 0:
-            train_log["train/ortho_loss"] = sum_ortho / max(1, n)
-        if args.smooth_loss_w > 0:
-            train_log["train/smooth_loss"] = sum_smooth / max(1, n)
-        if args.sparsity_loss_w > 0:
-            train_log["train/sparsity_loss"] = sum_sparsity / max(1, n)
-        if args.ctx_contrast_w > 0:
-            train_log["train/ctx_contrast_loss"] = sum_ctx_contrast / max(1, n)
-        if args.proto_loss_w > 0:
-            train_log["train/proto_inst_loss"] = sum_proto_inst / max(1, n)
-        if args.cls_contrast_w > 0:
-            train_log["train/cls_contrast_loss"] = sum_cls_contrast / max(1, n)
-
-        wandb.log(train_log, step=epoch)
+        }, step=epoch)
 
     return total_loss / max(1, n)
 
 
 def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 0.5, proto_bank=None, is_main=True):
-    milnet.eval()
+    if isinstance(milnet, nn.parallel.DistributedDataParallel):
+        model = milnet.module
+    else:
+        model = milnet
+    model.eval()
     total_loss = 0.0
     all_labels = []
     all_probs  = []
@@ -451,14 +580,15 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             
             bag_feats = feats.to(device)
             bag_label = label.to(device)   # [B, C]
-            x_cls = None
-            x_seq = None
 
             if args.model == 'AmbiguousMIL':
-                out = milnet(bag_feats)
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = out
+                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = model(bag_feats)
+            elif args.model == 'MILLET':
+                bag_prediction, instance_pred, interpretation = model(bag_feats)
+                attn_layer2 = None
+                x_seq = None
             elif args.model == 'newTimeMIL':
-                out = milnet(bag_feats)
+                out = model(bag_feats)
                 instance_pred = None
                 attn_layer2 = None
                 if isinstance(out, (tuple, list)):
@@ -467,7 +597,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 else:
                     bag_prediction = out
             elif args.model == 'TimeMIL':
-                out = milnet(bag_feats)
+                out = model(bag_feats)
                 instance_pred = None
                 attn_layer2 = None
                 if isinstance(out, (tuple, list)):
@@ -475,9 +605,6 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                     attn_layer2 = out[2]
                 else:
                     bag_prediction = out
-            elif args.model == 'MILLET':
-                bag_prediction, non_weighted_instance_pred, instance_pred = milnet(bag_feats)
-                attn_layer2 = None
             else:
                 raise ValueError(f"Unknown model name: {args.model}")
 
@@ -485,46 +612,46 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             bag_loss = criterion(bag_prediction, bag_label)
 
             inst_loss = 0.0
-            ortho_loss = torch.tensor(0.0, device=device)
-            smooth_loss = torch.tensor(0.0, device=device)
-            sparsity_loss = torch.tensor(0.0, device=device)
+            # ortho_loss = torch.tensor(0.0, device=device)
+            # smooth_loss = torch.tensor(0.0, device=device)
+            # sparsity_loss = torch.tensor(0.0, device=device)
             proto_inst_loss = torch.tensor(0.0, device=device)
-            cls_contrast_loss = torch.tensor(0.0, device=device)
+            # cls_contrast_loss = torch.tensor(0.0, device=device)
 
-            if args.model == 'AmbiguousMIL':
-                # instance → bag MIL loss
-                p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
-                eps = 1e-6
-                p_bag_from_inst = 1 - torch.prod(
-                    torch.clamp(1 - p_inst, min=eps), dim=1
-                )                                           # [B, C]
-                inst_loss = F.binary_cross_entropy(
-                    p_bag_from_inst, bag_label.float()
-                )
+            if instance_pred is not None:
+                # # instance → bag MIL loss
+                # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
+                # eps = 1e-6
+                # p_bag_from_inst = 1 - torch.prod(
+                #     torch.clamp(1 - p_inst, min=eps), dim=1
+                # )                                           # [B, C]
+                # inst_loss = F.binary_cross_entropy(
+                #     p_bag_from_inst, bag_label.float()
+                # )
 
-                # class token orthogonality
-                if x_cls is not None:
-                    ortho_loss = class_token_orthogonality_loss(x_cls)
-                else:
-                    ortho_loss = torch.tensor(0.0, device=device)
+                p_inst = instance_pred.mean(dim=1)       # [B, C]
+                inst_loss = criterion(p_inst, bag_label)
 
-                # 이번 배치에서 실제로 등장한 positive class만 선택
-                pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+                # # class token orthogonality
+                # ortho_loss = class_token_orthogonality_loss(x_cls)
 
-                # sparsity loss
-                sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
-                if pos_mask.sum() > 0:
-                    sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
-                        pos_mask.sum() + 1e-6
-                    )
-                else:
-                    sparsity_loss = torch.tensor(0.0, device=device)
-                sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
+                # # 이번 배치에서 실제로 등장한 positive class만 선택
+                # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
 
-                # temporal smoothness loss
-                diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
-                diff = diff * pos_mask[None, None, :]         # broadcast
-                smooth_loss = (diff ** 2).mean()
+                # # sparsity loss
+                # sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
+                # if pos_mask.sum() > 0:
+                #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
+                #         pos_mask.sum() + 1e-6
+                #     )
+                # else:
+                #     sparsity_loss = torch.tensor(0.0, device=device)
+                # sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
+
+                # # temporal smoothness loss
+                # diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
+                # diff = diff * pos_mask[None, None, :]         # broadcast
+                # smooth_loss = (diff ** 2).mean()
 
                 # prototype 기반 instance CL (eval에서는 update 없이 loss만)
                 if (epoch >= args.epoch_des) and (proto_bank is not None):
@@ -537,74 +664,66 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                         win=getattr(args, "proto_win", 5),
                     )
 
-                # batch 내 class embedding contrastive loss (proto_bank 사용 X)
-                if x_cls is not None:
-                    cls_contrast_loss = batch_class_embedding_contrastive_loss(
-                        x_cls, bag_label, tau=getattr(args, "cls_contrast_tau", 0.1)
-                    )
-                else:
-                    cls_contrast_loss = torch.tensor(0.0, device=device)
+                if args.datatype == "mixed" and (y_inst is not None):
+                    # y_inst: [B, T, C] one-hot instance labels
+                    y_inst = y_inst.to(device)
+                    y_inst_label = torch.argmax(y_inst, dim=2)  # [B, T]
 
-            if args.datatype == "mixed" and (y_inst is not None):
-                # y_inst: [B, T, C] one-hot instance labels
-                # CPU에 있어도 되지만, 일단 계산 편의를 위해 device로 올림
-                y_inst = y_inst.to(device)
-                # timestep별 정답 클래스 인덱스
-                y_inst_label = torch.argmax(y_inst, dim=2)  # [B, T]
+                    if args.model == 'AmbiguousMIL':
+                        pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
+                    elif args.model == 'MILLET':
+                        pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
+                    elif args.model == 'newTimeMIL' and attn_layer2 is not None:
+                        B, T, C = y_inst.shape
+                        attn_cls = attn_layer2[:,:,:C,C:]
+                        attn_mean = attn_cls.mean(dim=1)
+                        pred_inst = torch.argmax(attn_mean, dim=1).cpu()
+                    else:
+                        pred_inst = None
 
-                # AmbiguousMIL인 경우 instance_pred에서 직접 argmax
-                if args.model == 'AmbiguousMIL':
-                    pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
-                elif args.model == 'MILLET':
-                    pred_inst = torch.argmax(instance_pred, dim=1)  # [B, T]
-                elif args.model == 'newTimeMIL' and attn_layer2 is not None:
-                    B, T, C = y_inst.shape
-                    attn_cls = attn_layer2[:,:,:C,C:]
-                    attn_mean = attn_cls.mean(dim=1)
-                    pred_inst = torch.argmax(attn_mean, dim=1).cpu()
-                else:
-                    pred_inst = None
+                    if pred_inst is not None:
+                        correct = (pred_inst == y_inst_label).sum().item()
+                        count   = y_inst_label.numel()
+                        inst_total_correct += correct
+                        inst_total_count   += count
 
-                if pred_inst is not None:
-                    correct = (pred_inst == y_inst_label).sum().item()
-                    count   = y_inst_label.numel()
-                    inst_total_correct += correct
-                    inst_total_count   += count
+            if args.model == 'AmbiguousMIL':
+                loss = (
+                    args.bag_loss_w * bag_loss
+                    + args.inst_loss_w * inst_loss
+                    # + args.ortho_loss_w * ortho_loss
+                    # + args.smooth_loss_w * smooth_loss
+                    # + args.sparsity_loss_w * sparsity_loss
+                    + args.proto_loss_w * proto_inst_loss
+                    # + args.cls_contrast_w * cls_contrast_loss
+                )
+            else:
+                loss = bag_loss
 
-        if args.model == 'AmbiguousMIL':
-            loss = (
-                args.bag_loss_w * bag_loss
-                + args.inst_loss_w * inst_loss
-                + args.ortho_loss_w * ortho_loss
-                + args.smooth_loss_w * smooth_loss
-                + args.sparsity_loss_w * sparsity_loss
-                + args.proto_loss_w * proto_inst_loss
-                + args.cls_contrast_w * cls_contrast_loss
-            )
-        else:
-            loss = bag_loss
+            if is_main:
+                sys.stdout.write(
+                    '\r [Val]   Epoch %d | bag [%d/%d] bag loss: %.4f  total loss: %.4f' %
+                    (epoch, batch_id, len(testloader), bag_loss.item(), loss.item())
+                )
 
-        if is_main:
-            sys.stdout.write(
-                '\r [Val]   Epoch %d | bag [%d/%d] bag loss: %.4f  total loss: %.4f' %
-                (epoch, batch_id, len(testloader), bag_loss.item(), loss.item())
-            )
+            total_loss += loss.item()
+            
+            if args.model == 'AmbiguousMIL':
+                probs = torch.sigmoid(p_inst).cpu().numpy() # p_inst is main output for evaluation
+            else:
+                probs = torch.sigmoid(bag_prediction).cpu().numpy()
+            all_probs.append(probs)
+            all_labels.append(label.cpu().numpy())
 
-        total_loss += loss.item()
-
-        probs = torch.sigmoid(bag_prediction).cpu().numpy()
-        all_probs.append(probs)
-        all_labels.append(label.cpu().numpy())
-
-        sum_bag += bag_loss.item()
-        sum_inst += float(inst_loss) if isinstance(inst_loss, float) else float(inst_loss)
-        sum_ortho += ortho_loss.item()
-        sum_smooth += smooth_loss.item()
-        sum_sparsity += sparsity_loss.item()
-        sum_proto_inst += proto_inst_loss.item()
-        sum_cls_contrast += cls_contrast_loss.item()
-        sum_total += loss.item()
-        n += 1
+            sum_bag += bag_loss.item()
+            sum_inst += float(inst_loss) if isinstance(inst_loss, float) else float(inst_loss)
+            # sum_ortho += ortho_loss.item()
+            # sum_smooth += smooth_loss.item()
+            # sum_sparsity += sparsity_loss.item()
+            sum_proto_inst += proto_inst_loss.item()
+            # sum_cls_contrast += cls_contrast_loss.item()
+            sum_total += loss.item()
+            n += 1
 
     # metric 계산
     y_true = np.vstack(all_labels)
@@ -644,22 +763,15 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
     if is_main and wandb.run is not None:
         log_dict = {
             "val/bag_loss": sum_bag / max(1, n),
+            "val/inst_loss": sum_inst / max(1, n),
+            # "val/ortho_loss": sum_ortho / max(1, n),
+            # "val/smooth_loss": sum_smooth / max(1, n),
+            # "val/sparsity_loss": sum_sparsity / max(1, n),
+            # "val/ctx_contrast_loss": sum_ctx_contrast / max(1, n),
+            "val/proto_inst_loss": sum_proto_inst / max(1, n),
+            # "val/cls_contrast_loss": sum_cls_contrast / max(1, n),
             "val/total_loss": sum_total / max(1, n),
         }
-        if args.inst_loss_w > 0:
-            log_dict["val/inst_loss"] = sum_inst / max(1, n)
-        if args.ortho_loss_w > 0:
-            log_dict["val/ortho_loss"] = sum_ortho / max(1, n)
-        if args.smooth_loss_w > 0:
-            log_dict["val/smooth_loss"] = sum_smooth / max(1, n)
-        if args.sparsity_loss_w > 0:
-            log_dict["val/sparsity_loss"] = sum_sparsity / max(1, n)
-        if args.ctx_contrast_w > 0:
-            log_dict["val/ctx_contrast_loss"] = sum_ctx_contrast / max(1, n)
-        if args.proto_loss_w > 0:
-            log_dict["val/proto_inst_loss"] = sum_proto_inst / max(1, n)
-        if args.cls_contrast_w > 0:
-            log_dict["val/cls_contrast_loss"] = sum_cls_contrast / max(1, n)
         if bag_acc is not None:
             log_dict["val/bag_acc"] = bag_acc
         wandb.log(log_dict, step=epoch)
@@ -694,13 +806,12 @@ def main():
     parser.add_argument('--weight_decay', default=1e-4, type=float, help='Weight decay 1e-4]')
     parser.add_argument('--dropout_patch', default=0.5, type=float, help='Patch dropout rate [0] 0.5')
     parser.add_argument('--dropout_node', default=0.2, type=float, help='Bag classifier dropout rate [0]')
-    parser.add_argument('--millet_pooling', default='conjunctive', type=str,
-                        help="Pooling for MILLET (conjunctive | attention | instance | additive | gap)")
     parser.add_argument('--seed', default=0, type=int, help='random seed')
-    parser.add_argument('--model', default='TimeMIL', type=str,
-                        help='MIL model (TimeMIL | newTimeMIL | AmbiguousMIL | MILLET)')
+    parser.add_argument('--model', default='TimeMIL', type=str, help='MIL model')
     parser.add_argument('--prepared_npz', type=str, default='./data/PAMAP2.npz', help='전처리 결과 npz 경로 (예: ./data/PAMAP2.npz)')
     parser.add_argument('--optimizer', default='adamw', type=str, help='adamw sgd')
+    parser.add_argument('--millet_pooling', default='conjunctive', type=str,
+                        help="Pooling for MILLET (conjunctive | attention | instance | additive | gap)")
 
     parser.add_argument('--save_dir', default='./savemodel/', type=str, help='the directory used to save all the output')
     parser.add_argument('--epoch_des', default=20, type=int, help='turn on warmup')
@@ -718,16 +829,14 @@ def main():
                         help='similarity threshold to treat instance as confident')
     parser.add_argument('--proto_win', type=int, default=5,
                         help='temporal neighbor window for ambiguous instances')
-    parser.add_argument('--threshold', type=float, default=0.5,
-                        help='decision threshold for bag prediction (default: 0.5)')
     # loss weights
     parser.add_argument('--bag_loss_w', type=float, default=0.5, help='weight for bag-level loss')
-    parser.add_argument('--inst_loss_w', type=float, default=0.0, help='weight for instance-level MIL loss')
+    parser.add_argument('--inst_loss_w', type=float, default=0.2, help='weight for instance-level MIL loss')
     parser.add_argument('--ortho_loss_w', type=float, default=0.0, help='weight for class token orthogonality loss')
-    parser.add_argument('--smooth_loss_w', type=float, default=0.0, help='weight for temporal smoothness loss')
-    parser.add_argument('--sparsity_loss_w', type=float, default=0.0, help='weight for sparsity loss')
+    parser.add_argument('--smooth_loss_w', type=float, default=0.05, help='weight for temporal smoothness loss')
+    parser.add_argument('--sparsity_loss_w', type=float, default=0.05, help='weight for sparsity loss')
     parser.add_argument('--ctx_contrast_w', type=float, default=0.0, help='weight for context contrastive loss')
-    parser.add_argument('--proto_loss_w', type=float, default=0.0, help='weight for prototype instance contrastive loss')
+    parser.add_argument('--proto_loss_w', type=float, default=0.2, help='weight for prototype instance contrastive loss')
     parser.add_argument('--cls_contrast_tau', type=float, default=0.1, help='temperature for batch class embedding contrastive loss')
     parser.add_argument('--cls_contrast_w', type=float, default=0.0, help='weight for batch class embedding contrastive loss')
     args = parser.parse_args()
@@ -818,25 +927,20 @@ def main():
         if is_main:
             print(f'num class:{args.num_classes}')
     else:
-        def _load_split_with_meta(name: str, split: str, extract_path: str):
-            """Wrapper to always return (X, y, meta) even if aeon returns only (X, y)."""
-            res = load_classification(
-                name=name,
-                split=split,
-                extract_path=extract_path,
-                return_metadata=True,
-            )
-            if isinstance(res, tuple):
-                if len(res) == 3:
-                    return res
-                if len(res) == 2:
-                    X, y = res
-                    meta = {"class_values": list(dict.fromkeys(y))}
-                    return X, y, meta
-            raise ValueError(f"Unexpected return from load_classification for {name} ({split}): {type(res)} len={len(res) if hasattr(res,'__len__') else 'na'}")
+        res_tr = load_classification(name=args.dataset, split='train', extract_path='./data')
+        res_te = load_classification(name=args.dataset, split='test',  extract_path='./data')
 
-        Xtr, ytr, meta = _load_split_with_meta(name=args.dataset, split='train', extract_path='./data')
-        Xte, yte, _   = _load_split_with_meta(name=args.dataset, split='test',  extract_path='./data')
+        # aeon 버전에 따라 meta가 없는 경우가 있어 대응
+        if len(res_tr) == 3:
+            Xtr, ytr, meta = res_tr
+        else:
+            Xtr, ytr = res_tr
+            meta = {'class_values': np.unique(ytr)}
+
+        if len(res_te) == 3:
+            Xte, yte, _meta_unused = res_te
+        else:
+            Xte, yte = res_te
 
         word_to_idx = {cls:i for i, cls in enumerate(meta['class_values'])}
         ytr_idx = torch.tensor([word_to_idx[i] for i in ytr], dtype=torch.long)
@@ -921,18 +1025,20 @@ def main():
         optimizer = Lookahead(optimizer, alpha=0.5, k=5)
 
     # ---------------- Batch size ----------------
-    if args.dataset in ['DuckDuckGeese','PenDigits','FingerMovements','BasicMotions','ERing','EigenWorms','HandMovementDirection','LSST','RacketSports','UWaveGestureLibrary']:
+    if args.dataset in ['DuckDuckGeese','PenDigits','FingerMovements','BasicMotions','ERing','EigenWorms','HandMovementDirection','RacketSports','UWaveGestureLibrary']:
         batch = 64
     elif args.dataset in ['Heartbeat']:
         batch = 32
-    elif args.dataset in ['FaceDetection','EthanolConcentration','NATOPS','JapaneseVowels','MotorImagery','SelfRegulationSCP1']:
+    elif args.dataset in ['EthanolConcentration','NATOPS','JapaneseVowels','MotorImagery','SelfRegulationSCP1']:
         batch = 16
-    elif args.dataset in ['Libras','PEMS-SF','SelfRegulationSCP2','AtrialFibrillation','Cricket']:
+    elif args.dataset in ['PEMS-SF','SelfRegulationSCP2','AtrialFibrillation','Cricket']:
         batch = 8
     elif args.dataset in ['StandWalkJump']:
-        batch = 4
-    elif args.dataset in ['Handwriting','Epilepsy','ArticularyWordRecognition','PhonemeSpectra']:
+        batch = 1
+    elif args.dataset in ['Libras','Handwriting','Epilepsy','ArticularyWordRecognition','PhonemeSpectra']:
         batch = 128
+    elif args.dataset in ['FaceDetection','LSST']:
+        batch = 512
     else:
         batch = args.batchsize
 
@@ -965,9 +1071,9 @@ def main():
     def _is_better(new_res, best_res):
         """
         Compare results with priority:
-        1) primary metric (bag_acc for original, mAP_macro for mixed)
-        2) F1 macro
-        3) instance accuracy (if both exist)
+        1) primary metric (mAP or acc) by 4 sf
+        2) F1 macro by 4 sf
+        3) instance accuracy by 4 sf (if both exist)
         """
         primary_key = "bag_acc" if args.datatype == "original" else "mAP_macro"
         new_primary = new_res.get(primary_key, 0.0)
@@ -1006,11 +1112,11 @@ def main():
         if isinstance(trainloader.sampler, DistributedSampler):
             trainloader.sampler.set_epoch(epoch)
 
-        train_loss_bag = train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=proto_bank, is_main=is_main)
+        train_loss_bag = train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=proto_bank, is_main=is_main, world_size=world_size)
 
         # validation은 rank 0에서만 수행
         if is_main:
-            test_loss_bag, results = test(testloader, milnet, criterion, epoch, args, device, threshold=args.threshold, proto_bank=proto_bank, is_main=is_main)
+            test_loss_bag, results = test(testloader, milnet, criterion, epoch, args, device, threshold=0.5, proto_bank=proto_bank, is_main=is_main)
 
             if wandb.run is not None:
                 log_score = {
@@ -1169,7 +1275,7 @@ def main():
 
             # Reuse testloader for classification metrics/instance accuracy
             test_loss_final, results_final = test(testloader, eval_model, criterion, epoch=args.num_epochs,
-                                                  args=args, device=device, threshold=args.threshold,
+                                                  args=args, device=device, threshold=0.5,
                                                   proto_bank=None, is_main=is_main)
             if logger is not None:
                 if "inst_acc" in results_final:
@@ -1196,7 +1302,7 @@ def main():
 
             # AOPCR with batch_size=1 for perturbation routine
             testloader_aopcr = DataLoader(
-                testset, batch_size=batch, shuffle=False,
+                testset, batch_size=1, shuffle=False,
                 num_workers=args.num_workers, drop_last=False, pin_memory=True
             )
             print("Computing class-wise AOPCR with best model ...")
@@ -1207,7 +1313,7 @@ def main():
                 stop=0.5,
                 step=0.05,
                 n_random=3,
-                pred_threshold=args.threshold,
+                pred_threshold=0.5,
             )
             for c in range(args.num_classes):
                 name = str(c)

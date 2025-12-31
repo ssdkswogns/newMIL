@@ -1,38 +1,33 @@
 #!/bin/bash
 
-# 실행할 데이터셋 목록
-DATASETS=(
-  "ArticularyWordRecognition"
-  # "AtrialFibrillation"
-  "BasicMotions"
-  "Cricket"
-  "DuckDuckGeese"
-  "Epilepsy"
-  "EthanolConcentration"
-  "ERing"
-  "FaceDetection"
-  "FingerMovements"
-  "HandMovementDirection"
-  "Handwriting"
-  # "Heartbeat"
-  "Libras"
-  "LSST"
-  # "MotorImagery"
-  "NATOPS"
-  "PenDigits"
-  "PEMS-SF"
+ROOT="./savemodel/millet_mixed_data"
+
+# 다시 돌리고 싶은 데이터셋만 지정하면 아래 리스트를 사용.
+# 비워두면 ROOT 아래 모든 폴더를 자동 수집.
+RETRY_DATASETS=(
   "PhonemeSpectra"
   "RacketSports"
   "SelfRegulationSCP1"
   "SelfRegulationSCP2"
-  "StandWalkJump"
   "UWaveGestureLibrary"
-  # "JapaneseVowels"
+  "StandWalkJump"
 )
+
+# dataset 리스트 결정
+if [[ ${#RETRY_DATASETS[@]} -gt 0 ]]; then
+  DATASETS=("${RETRY_DATASETS[@]}")
+else
+  DATASETS=()
+  if [[ -d "$ROOT" ]]; then
+    while IFS= read -r d; do
+      DATASETS+=("$(basename "$d")")
+    done < <(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
+  fi
+fi
 
 # 반복 실행
 for d in "${DATASETS[@]}"; do
-  latest_exp_dir=$(ls -d "./savemodel/InceptBackbone/$d"/exp_* 2>/dev/null | sort -V | tail -n 1)
+  latest_exp_dir=$(ls -d "$ROOT/$d"/exp_* 2>/dev/null | sort -V | tail -n 1)
 
   if [[ -z "$latest_exp_dir" ]]; then
     echo "Skipping $d (no exp_* directory found)"

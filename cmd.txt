@@ -19,4 +19,6 @@ python collect_aopcr.py \
 python collect_aopcr.py \
 --max-exp-id
 
-python3 move_latest_exps.py --dest ./savemodel/millet_mixed_data
+--bag_loss_w 0.5 --inst_loss_w 0.35 --proto_loss_w 0.15 \
+--attn_temp 0.3 --attn_softmax \
+--proto_topk_ratio 0.5 --proto_sim_thresh 0.65
