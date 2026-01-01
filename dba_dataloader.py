@@ -109,6 +109,118 @@ def _build_windows_from_sequences(
     y = np.array(y_list, dtype=np.int64)
     return X, y
 
+def _get_driver_id_from_csv(csv_path: str) -> str:
+    """
+    csv_path: .../<driver>/<style>/parsed_50hz.csv
+    여기서 <driver> 폴더 이름을 driver_id로 사용.
+    """
+    style_dir = os.path.dirname(csv_path)          # .../<driver>/<style>
+    driver_dir = os.path.dirname(style_dir)        # .../<driver>
+    driver_id = os.path.basename(driver_dir)       # "1_xxx" 같은 이름
+    return driver_id
+
+
+def _split_sequences_by_driver(
+    seq_list: List[Tuple[str, int]],
+    test_ratio: float,
+    seed: int = 42,
+):
+    """
+    seq_list: [(csv_path, label_int), ...]
+    -> driver 단위로 묶어서 train/test split.
+
+    전제:
+      - 각 driver가 aggressive/normal/conservative 1개씩 갖고 있음.
+    보장:
+      - test drivers가 1명 이상이면 test에 3개 class 모두 등장.
+    """
+    # driver_id -> [(csv_path, label_int), ...]
+    driver_to_seqs = {}
+    for csv_path, label in seq_list:
+        driver_id = _get_driver_id_from_csv(csv_path)
+        driver_to_seqs.setdefault(driver_id, []).append((csv_path, label))
+
+    driver_ids = list(driver_to_seqs.keys())
+    rng = random.Random(seed)
+    rng.shuffle(driver_ids)
+
+    n_driver_total = len(driver_ids)
+    n_driver_test = max(1, int(round(n_driver_total * test_ratio)))
+    n_driver_train = n_driver_total - n_driver_test
+    if n_driver_train == 0:
+        # extreme case: 모든 driver가 test로 가는 경우 방지
+        n_driver_train = 1
+        n_driver_test = n_driver_total - 1
+
+    test_driver_ids  = set(driver_ids[:n_driver_test])
+    train_driver_ids = set(driver_ids[n_driver_test:])
+
+    train_seqs: List[Tuple[str, int]] = []
+    test_seqs:  List[Tuple[str, int]] = []
+
+    for d in train_driver_ids:
+        train_seqs.extend(driver_to_seqs[d])
+    for d in test_driver_ids:
+        test_seqs.extend(driver_to_seqs[d])
+
+    rng.shuffle(train_seqs)
+    rng.shuffle(test_seqs)
+
+    print(
+        f"[DBA] drivers total: {n_driver_total}, "
+        f"train: {len(train_driver_ids)}, test: {len(test_driver_ids)}"
+    )
+
+    train_short = sorted(d.split('_')[0] for d in train_driver_ids)
+    test_short  = sorted(d.split('_')[0] for d in test_driver_ids)
+    print(f"[DBA] train driver ids: {train_short}")
+    print(f"[DBA] test  driver ids: {test_short}")
+
+    return train_seqs, test_seqs
+
+def _stratified_split_sequences(
+    seq_list: List[Tuple[str, int]],
+    test_ratio: float,
+    seed: int = 42,
+):
+    """
+    seq_list: [(csv_path, label_int), ...]
+    각 label 별로 비율에 맞춰 train/test를 나누되,
+    각 label이 test에 최소 1개씩은 들어가도록 하는 split.
+    """
+    # label -> [(csv_path, label_int), ...]
+    by_label = {}
+    for path, label in seq_list:
+        by_label.setdefault(label, []).append((path, label))
+
+    rng = random.Random(seed)
+
+    train_seqs = []
+    test_seqs  = []
+
+    for label, items in by_label.items():
+        items = items[:]  # copy
+        rng.shuffle(items)
+
+        n_total = len(items)
+        if n_total == 0:
+            continue
+
+        # 각 클래스가 test에 최소 1개는 들어가도록 보장
+        n_test = max(1, int(round(n_total * test_ratio)))
+        n_train = n_total - n_test
+
+        # n_train이 0이 될 수도 있음 (해당 클래스 전체가 test로 가는 경우)
+        test_seqs.extend(items[:n_test])
+        train_seqs.extend(items[n_test:])
+
+    # 전체적으로도 다시 한 번 섞어주는 것이 좋습니다 (순서 랜덤화)
+    rng.shuffle(train_seqs)
+    rng.shuffle(test_seqs)
+
+    return train_seqs, test_seqs
+
+
 
 # ============================================
 # 4) TimeMIL용 빌더
@@ -137,16 +249,15 @@ def build_dba_tensors(
     if len(seq_list) == 0:
         raise RuntimeError(f"No parsed_50hz.csv found under: {root_dir}")
 
-    rng = random.Random(seed)
-    rng.shuffle(seq_list)
+    # train_seqs, test_seqs = _stratified_split_sequences(
+    #     seq_list, test_ratio=test_ratio, seed=seed
+    # )
+    train_seqs, test_seqs = _split_sequences_by_driver(
+        seq_list, test_ratio=test_ratio, seed=seed
+    )
 
-    n_total = len(seq_list)
-    n_test = int(round(n_total * test_ratio))
-    n_train = n_total - n_test
-    train_seqs = seq_list[:n_train]
-    test_seqs  = seq_list[n_train:]
-
-    print(f"[DBA] total seqs: {n_total}, train: {len(train_seqs)}, test: {len(test_seqs)}")
+    print(f"[DBA] total seqs: {len(seq_list)}, "
+        f"train: {len(train_seqs)}, test: {len(test_seqs)}")
 
     Xtr, ytr = _build_windows_from_sequences(train_seqs, feature_cols, window_size, stride)
     Xte, yte = _build_windows_from_sequences(test_seqs, feature_cols, window_size, stride)
@@ -303,15 +414,12 @@ def build_dba_windows_for_mixed(
     if len(seq_list) == 0:
         raise RuntimeError(f"No parsed_50hz.csv found under: {root_dir}")
 
-    # 시퀀스 단위 train/test split
-    rng = random.Random(seed)
-    rng.shuffle(seq_list)
-
-    n_total = len(seq_list)
-    n_test  = int(round(n_total * test_ratio))
-    n_train = n_total - n_test
-    train_seqs = seq_list[:n_train]
-    test_seqs  = seq_list[n_train:]
+#     train_seqs, test_seqs = _stratified_split_sequences(
+#         seq_list, test_ratio=test_ratio, seed=seed
+# )
+    train_seqs, test_seqs = _split_sequences_by_driver(
+        seq_list, test_ratio=test_ratio, seed=seed
+    )
 
     # 기존 _build_windows_from_sequences 재사용
     Xtr_np, ytr_np = _build_windows_from_sequences(

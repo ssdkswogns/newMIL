@@ -135,18 +135,19 @@ def compute_classwise_aopcr(
             if not isinstance(out, (tuple, list)):
                 raise ValueError("AmbiguousMIL output must be a tuple/list")
             logits, instance_logits, x_cls, x_seq, _c_seq, attn_layer1, attn_layer2 = out
+            prob = torch.sigmoid(instance_logits.mean(dim=1))  # bag-level prob from instance logits
         elif args.model == 'TimeMIL':
             out = milnet(x)
             logits, attn_layer1, attn_layer2 = out
+            prob = torch.sigmoid(logits)
             instance_logits = None
         elif args.model == 'newTimeMIL':
             out = milnet(x)
             logits, x_cls, attn_layer1, attn_layer2 = out
+            prob = torch.sigmoid(logits)
             instance_logits = None
         else:
             raise ValueError(f"Unknown model name: {args.model}")
-
-        prob = torch.sigmoid(logits)       # [B, C]
 
         for b in range(batch_size):
             if y_bag.dim() == 1:
@@ -169,7 +170,8 @@ def compute_classwise_aopcr(
                 # ----- timestep 중요도 score 계산 -----
                 if args.model == 'AmbiguousMIL' and instance_logits is not None:
                     # instance_logits: [B, T, C] -> softmax 후 target class prob 사용
-                    s_all = torch.softmax(instance_logits[b], dim=-1)   # [T, C]
+                    # s_all = torch.softmax(instance_logits[b], dim=-1)   # [T, C]
+                    s_all = instance_logits[b]   # [T, C]
                     scores = s_all[:, pred_c]                           # [T]
                 else:
                     # TimeMIL / newTimeMIL: class-token → time-token attention 기반

@@ -405,8 +405,6 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
     n = 0
 
     for batch_id, (feats, label) in enumerate(trainloader):
-        print(feats)
-        print(label)
         bag_feats = feats.to(device)
         bag_label = label.to(device)   # [B, C] multi-hot
 
@@ -457,25 +455,26 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             # inst_loss = F.binary_cross_entropy(
             #     p_bag_from_inst, bag_label.float()
             # )
+            instance_pred = torch.sigmoid(instance_pred)   # [B,T,C]
             p_inst = instance_pred.mean(dim=1)       # [B, C]
             inst_loss = criterion(p_inst, bag_label)
 
             # ortho_loss = class_token_orthogonality_loss(x_cls)
 
-            # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+            pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
 
-            # sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
-            # if pos_mask.sum() > 0:
-            #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
-            #         pos_mask.sum() + 1e-6
-            #     )
-            # else:
-            #     sparsity_loss = torch.tensor(0.0, device=device)
-            # sparsity_loss = sparsity_per_class.mean()
+            sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
+            if pos_mask.sum() > 0:
+                sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
+                    pos_mask.sum() + 1e-6
+                )
+            else:
+                sparsity_loss = torch.tensor(0.0, device=device)
+            sparsity_loss = sparsity_per_class.mean()
 
-            # diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
-            # diff = diff * pos_mask[None, None, :]
-            # smooth_loss = (diff ** 2).mean()
+            diff = instance_pred[:, 1:, :] - instance_pred[:, :-1, :]   # [B, T-1, C]
+            diff = diff * pos_mask[None, None, :]
+            smooth_loss = (diff ** 2).mean()
 
             # ---------- prototype 기반 instance CL ----------
             if (epoch >= args.epoch_des) and (proto_bank is not None):
@@ -497,8 +496,8 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                 args.bag_loss_w * bag_loss
                 + args.inst_loss_w * inst_loss
                 # + args.ortho_loss_w * ortho_loss
-                # + args.smooth_loss_w * smooth_loss
-                # + args.sparsity_loss_w * sparsity_loss
+                + args.smooth_loss_w * smooth_loss
+                + args.sparsity_loss_w * sparsity_loss
                 + args.proto_loss_w * proto_inst_loss
                 # + args.cls_contrast_w * cls_contrast_loss
             )
@@ -520,8 +519,8 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         sum_bag += bag_loss.item()
         sum_inst += float(inst_loss) if isinstance(inst_loss, float) else float(inst_loss)
         # sum_ortho += ortho_loss.item()
-        # sum_smooth += smooth_loss.item()
-        # sum_sparsity += sparsity_loss.item()
+        sum_smooth += smooth_loss.item()
+        sum_sparsity += sparsity_loss.item()
         sum_proto_inst += proto_inst_loss.item()
         # sum_cls_contrast += cls_contrast_loss.item()
         sum_total += loss.item()
@@ -533,8 +532,8 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             "train/bag_loss": sum_bag / max(1, n),
             "train/inst_loss": sum_inst / max(1, n),
             # "train/ortho_loss": sum_ortho / max(1, n),
-            # "train/smooth_loss": sum_smooth / max(1, n),
-            # "train/sparsity_loss": sum_sparsity / max(1, n),
+            "train/smooth_loss": sum_smooth / max(1, n),
+            "train/sparsity_loss": sum_sparsity / max(1, n),
             # "train/ctx_contrast_loss": sum_ctx_contrast / max(1, n),
             "train/proto_inst_loss": sum_proto_inst / max(1, n),
             # "train/cls_contrast_loss": sum_cls_contrast / max(1, n),
@@ -608,8 +607,8 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
 
             inst_loss = 0.0
             # ortho_loss = torch.tensor(0.0, device=device)
-            # smooth_loss = torch.tensor(0.0, device=device)
-            # sparsity_loss = torch.tensor(0.0, device=device)
+            smooth_loss = torch.tensor(0.0, device=device)
+            sparsity_loss = torch.tensor(0.0, device=device)
             proto_inst_loss = torch.tensor(0.0, device=device)
             # cls_contrast_loss = torch.tensor(0.0, device=device)
 
@@ -623,30 +622,31 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 # inst_loss = F.binary_cross_entropy(
                 #     p_bag_from_inst, bag_label.float()
                 # )
-
+                
+                instance_pred = torch.sigmoid(instance_pred)   # [B,T,C]
                 p_inst = instance_pred.mean(dim=1)       # [B, C]
                 inst_loss = criterion(p_inst, bag_label)
 
                 # # class token orthogonality
                 # ortho_loss = class_token_orthogonality_loss(x_cls)
 
-                # # 이번 배치에서 실제로 등장한 positive class만 선택
-                # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+                # 이번 배치에서 실제로 등장한 positive class만 선택
+                pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
 
-                # # sparsity loss
-                # sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
-                # if pos_mask.sum() > 0:
-                #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
-                #         pos_mask.sum() + 1e-6
-                #     )
-                # else:
-                #     sparsity_loss = torch.tensor(0.0, device=device)
-                # sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
+                # sparsity loss
+                sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
+                if pos_mask.sum() > 0:
+                    sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
+                        pos_mask.sum() + 1e-6
+                    )
+                else:
+                    sparsity_loss = torch.tensor(0.0, device=device)
+                sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
 
-                # # temporal smoothness loss
-                # diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
-                # diff = diff * pos_mask[None, None, :]         # broadcast
-                # smooth_loss = (diff ** 2).mean()
+                # temporal smoothness loss
+                diff = instance_pred[:, 1:, :] - instance_pred[:, :-1, :]   # [B, T-1, C]
+                diff = diff * pos_mask[None, None, :]         # broadcast
+                smooth_loss = (diff ** 2).mean()
 
                 # prototype 기반 instance CL (eval에서는 update 없이 loss만)
                 if (epoch >= args.epoch_des) and (proto_bank is not None):
@@ -688,8 +688,8 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                     args.bag_loss_w * bag_loss
                     + args.inst_loss_w * inst_loss
                     # + args.ortho_loss_w * ortho_loss
-                    # + args.smooth_loss_w * smooth_loss
-                    # + args.sparsity_loss_w * sparsity_loss
+                    + args.smooth_loss_w * smooth_loss
+                    + args.sparsity_loss_w * sparsity_loss
                     + args.proto_loss_w * proto_inst_loss
                     # + args.cls_contrast_w * cls_contrast_loss
                 )
@@ -714,8 +714,8 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             sum_bag += bag_loss.item()
             sum_inst += float(inst_loss) if isinstance(inst_loss, float) else float(inst_loss)
             # sum_ortho += ortho_loss.item()
-            # sum_smooth += smooth_loss.item()
-            # sum_sparsity += sparsity_loss.item()
+            sum_smooth += smooth_loss.item()
+            sum_sparsity += sparsity_loss.item()
             sum_proto_inst += proto_inst_loss.item()
             # sum_cls_contrast += cls_contrast_loss.item()
             sum_total += loss.item()
@@ -761,8 +761,8 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             "val/bag_loss": sum_bag / max(1, n),
             "val/inst_loss": sum_inst / max(1, n),
             # "val/ortho_loss": sum_ortho / max(1, n),
-            # "val/smooth_loss": sum_smooth / max(1, n),
-            # "val/sparsity_loss": sum_sparsity / max(1, n),
+            "val/smooth_loss": sum_smooth / max(1, n),
+            "val/sparsity_loss": sum_sparsity / max(1, n),
             # "val/ctx_contrast_loss": sum_ctx_contrast / max(1, n),
             "val/proto_inst_loss": sum_proto_inst / max(1, n),
             # "val/cls_contrast_loss": sum_cls_contrast / max(1, n),
