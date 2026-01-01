@@ -27,7 +27,8 @@ from aeon.datasets import load_classification
 from syntheticdataset import MixedSyntheticBagsConcatK
 from utils import *
 from mydataload import loadorean
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMILwithCL
+from models.timemil import TimeMIL, newTimeMIL
+from models.expmil import AmbiguousMILwithCL
 from compute_aopcr import compute_classwise_aopcr
 
 warnings.filterwarnings("ignore")
@@ -63,27 +64,30 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
             if args.model == 'AmbiguousMIL':
                 if not isinstance(out, (tuple, list)) or len(out) < 6:
                     raise ValueError("Unexpected AmbiguousMIL output")
-                logits, instance_pred = out[0], out[1]
-                attn_layer2 = out[-1]
+                logits, instance_pred, pred_inst = out[0], out[1], out[2]
+                attn_layer2 = None
             else:
                 if not isinstance(out, (tuple, list)) or len(out) < 4:
                     raise ValueError("Unexpected model output")
                 logits, _, _, attn_layer2 = out
+                attn_cls = attn_layer2[:, :, :C, C:]
+                attn_mean = attn_cls.mean(dim=1)
                 instance_pred = None
 
             loss = criterion(logits, bag_label)
             total_loss += loss.item()
 
-            probs = torch.sigmoid(logits).cpu().numpy()  # [B, C]
+            if args.model == 'AmbiguousMIL':
+                probs = torch.sigmoid(instance_pred).cpu().numpy()
+            else:
+                probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.append(probs)
             all_labels.append(label.cpu().numpy())
 
             _, _, C = y_inst.shape
-            attn_cls = attn_layer2[:, :, :C, C:]
-            attn_mean = attn_cls.mean(dim=1)
 
             if args.model == 'AmbiguousMIL' and instance_pred is not None:
-                pred_inst = torch.argmax(instance_pred, dim=2).cpu()
+                pred_inst = torch.argmax(pred_inst, dim=2).cpu()
             else:
                 pred_inst = torch.argmax(attn_mean, dim=1).cpu()
 
@@ -222,8 +226,7 @@ def build_model(args, seq_len, num_classes, device):
     elif args.model == 'AmbiguousMIL':
         milnet = AmbiguousMILwithCL(args.feats_size, mDim=args.embed,
                                     n_classes=num_classes,
-                                    dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-                                    max_seq_len=seq_len, is_instance=True).to(device)
+                                    dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0, is_instance=True).to(device)
     else:
         raise Exception("Model not available")
     return milnet

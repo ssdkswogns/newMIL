@@ -16,7 +16,8 @@ from syntheticdataset import *
 from utils import *
 from mydataload import loadorean
 
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
+from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL
+from models.expmil import AmbiguousMILwithCL
 
 warnings.filterwarnings("ignore")
 
@@ -134,8 +135,9 @@ def compute_classwise_aopcr(
             out = milnet(x)
             if not isinstance(out, (tuple, list)):
                 raise ValueError("AmbiguousMIL output must be a tuple/list")
-            logits, instance_logits, x_cls, x_seq, _c_seq, attn_layer1, attn_layer2 = out
-            prob = torch.sigmoid(instance_logits.mean(dim=1))  # bag-level prob from instance logits
+            logits, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = out
+            prob = instance_pred  # bag-level prob from instance logits
+            instance_logits = weighted_instance_pred
         elif args.model == 'TimeMIL':
             out = milnet(x)
             logits, attn_layer1, attn_layer2 = out
@@ -168,7 +170,7 @@ def compute_classwise_aopcr(
                 pred_c = int(cls_tensor.item())
 
                 # ----- timestep 중요도 score 계산 -----
-                if args.model == 'AmbiguousMIL' and instance_logits is not None:
+                if args.model == 'AmbiguousMIL':
                     # instance_logits: [B, T, C] -> softmax 후 target class prob 사용
                     # s_all = torch.softmax(instance_logits[b], dim=-1)   # [T, C]
                     s_all = instance_logits[b]   # [T, C]
