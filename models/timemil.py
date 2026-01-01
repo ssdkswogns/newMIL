@@ -7,7 +7,7 @@ import numpy as np
 import random
 
 from models.inceptiontime import InceptionTimeFeatureExtractor
-from models.nystrom_attention import NystromAttention, Attention
+from models.nystrom_attention import NystromAttention, Attention, SDPAttention
 
 
 
@@ -62,6 +62,26 @@ class TransLayer_new(nn.Module):
         out, attn = self.attn(x_norm, return_attn=True)
         x = x + out
         return x, attn
+    
+class TransLayer_amb(nn.Module):
+    def __init__(self, dim=512, num_heads=8, dropout=0.2, norm_layer=nn.LayerNorm):
+        super().__init__()
+        assert dim % num_heads == 0, "dim은 num_heads로 나누어 떨어져야 합니다."
+        self.norm = norm_layer(dim)
+        self.attn = SDPAttention(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=True,
+            attn_drop=dropout,
+            proj_drop=dropout
+        )
+
+    def forward(self, x):
+        # Pre-Norm
+        x_norm = self.norm(x)
+        out= self.attn(x_norm)
+        x = x + out
+        return x
 
 ### Define Wavelet Kernel
 def mexican_hat_wavelet(size, scale, shift): #size :d*kernelsize  scale:d*1 shift:d*1
@@ -500,8 +520,8 @@ class AmbiguousMILwithCL(nn.Module):
         self.pos_layer = WaveletEncoding(mDim, max_seq_len, hidden_len) 
         self.pos_layer2 = WaveletEncoding(mDim, max_seq_len, hidden_len) 
 
-        self.layer1 = TransLayer_new(dim=mDim, dropout=dropout)
-        self.layer2 = TransLayer_new(dim=mDim, dropout=dropout)
+        self.layer1 = TransLayer_amb(dim=mDim, dropout=dropout)
+        self.layer2 = TransLayer_amb(dim=mDim, dropout=dropout)
         self.norm = nn.LayerNorm(mDim)
 
         # bag-level head
@@ -563,12 +583,14 @@ class AmbiguousMILwithCL(nn.Module):
         # WPE1
         x = self.pos_layer(x, self.wave1, self.wave2, self.wave3, self.n_classes)
         # TransLayer 1
-        x, attn_layer1 = self.layer1(x)
+        x = self.layer1(x)
+        attn_layer1 = None  # attention weights are not used in SDPA
         # WPE2
         x = self.pos_layer2(x, self.wave1_, self.wave2_, self.wave3_, self.n_classes)
+        
         # TransLayer 2
-        x, attn_layer2 = self.layer2(x)
-
+        x = self.layer2(x)
+        attn_layer2 = None  # attention weights are not used in SDPA
         # cls token branch
         x_cls = x[:, :C, :]                 # [B, C, D]
         x_cls_chfirst = x_cls.permute(0, 2, 1)  # [B, D, C]
