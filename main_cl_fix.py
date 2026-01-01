@@ -37,6 +37,7 @@ from lookhead import Lookahead
 import warnings
 
 from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
+from models.milet import MILLET
 from compute_aopcr import compute_classwise_aopcr
 
 from os.path import join
@@ -426,6 +427,8 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                 bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(
                     bag_feats, warmup=False
                 )
+        elif args.model == 'MILLET':
+            bag_prediction, non_weighted_instance_pred, instance_pred = milnet(bag_feats)
         else:
             if epoch < args.epoch_des:
                 bag_prediction = milnet(bag_feats, warmup=True)
@@ -693,6 +696,8 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                     + args.proto_loss_w * proto_inst_loss
                     # + args.cls_contrast_w * cls_contrast_loss
                 )
+            elif args.model == 'MILLET':
+                bag_prediction, non_weighted_instance_pred, instance_pred = milnet(bag_feats)
             else:
                 loss = bag_loss
 
@@ -706,6 +711,8 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             
             if args.model == 'AmbiguousMIL':
                 probs = torch.sigmoid(p_inst).cpu().numpy() # p_inst is main output for evaluation
+            elif args.model == 'MILLET':
+                pred_inst = torch.argmax(instance_pred, dim=1)  # [B, T]
             else:
                 probs = torch.sigmoid(bag_prediction).cpu().numpy()
             all_probs.append(probs)
@@ -804,6 +811,8 @@ def main():
     parser.add_argument('--dropout_node', default=0.2, type=float, help='Bag classifier dropout rate [0]')
     parser.add_argument('--seed', default=0, type=int, help='random seed')
     parser.add_argument('--model', default='TimeMIL', type=str, help='MIL model')
+    parser.add_argument('--millet_pooling', default='conjunctive', type=str,
+                        help="Pooling for MILLET (conjunctive | attention | instance | additive | gap)")
     parser.add_argument('--prepared_npz', type=str, default='./data/PAMAP2.npz', help='전처리 결과 npz 경로 (예: ./data/PAMAP2.npz)')
     parser.add_argument('--optimizer', default='adamw', type=str, help='adamw sgd')
 
@@ -1042,6 +1051,10 @@ def main():
         print(f"Transformer: {tr_params:,}  (WPE + TransLayer + heads 등)")
         print(f"Backbone 비율   : {fe_params / total_params * 100:.2f} %")
         print(f"Transformer 비율: {tr_params / total_params * 100:.2f} %")
+    elif args.model == 'MILLET':
+        base_model = MILLET(args.feats_size, mDim=args.embed, n_classes=num_classes,
+                            dropout=args.dropout_node, max_seq_len=seq_len,
+                            pooling=args.millet_pooling, is_instance=True).to(device)
     else:
         raise Exception("Model not available")
 
@@ -1300,6 +1313,10 @@ def main():
         elif args.model == 'AmbiguousMIL':
             eval_model = AmbiguousMILwithCL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
                                             dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
+        elif args.model == 'MILLET':
+            eval_model = MILLET(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
+                                dropout=args.dropout_node, max_seq_len=args.seq_len,
+                                pooling=args.millet_pooling, is_instance=True).to(device)
         else:
             eval_model = None
 
