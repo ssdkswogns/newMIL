@@ -448,7 +448,7 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         proto_inst_loss = torch.tensor(0.0, device=device)
         cls_contrast_loss = torch.tensor(0.0, device=device)
 
-        if instance_pred is not None:
+        if args.model == 'AmbiguousMIL':
             # ---------- 기존 MIL 부분 ----------
             # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
             # eps = 1e-6
@@ -602,6 +602,9 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                     attn_layer2 = out[2]
                 else:
                     bag_prediction = out
+            elif args.model == 'MILLET':
+                bag_prediction, non_weighted_instance_pred, instance_pred = milnet(bag_feats)
+                attn_layer2 = None
             else:
                 raise ValueError(f"Unknown model name: {args.model}")
 
@@ -615,7 +618,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             proto_inst_loss = torch.tensor(0.0, device=device)
             # cls_contrast_loss = torch.tensor(0.0, device=device)
 
-            if instance_pred is not None:
+            if args.model == 'AmbiguousMIL':
                 # # instance → bag MIL loss
                 # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
                 # eps = 1e-6
@@ -696,8 +699,6 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                     + args.proto_loss_w * proto_inst_loss
                     # + args.cls_contrast_w * cls_contrast_loss
                 )
-            elif args.model == 'MILLET':
-                bag_prediction, non_weighted_instance_pred, instance_pred = milnet(bag_feats)
             else:
                 loss = bag_loss
 
@@ -711,8 +712,6 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             
             if args.model == 'AmbiguousMIL':
                 probs = torch.sigmoid(p_inst).cpu().numpy() # p_inst is main output for evaluation
-            elif args.model == 'MILLET':
-                pred_inst = torch.argmax(instance_pred, dim=1)  # [B, T]
             else:
                 probs = torch.sigmoid(bag_prediction).cpu().numpy()
             all_probs.append(probs)
@@ -1055,6 +1054,7 @@ def main():
         base_model = MILLET(args.feats_size, mDim=args.embed, n_classes=num_classes,
                             dropout=args.dropout_node, max_seq_len=seq_len,
                             pooling=args.millet_pooling, is_instance=True).to(device)
+        proto_bank = None
     else:
         raise Exception("Model not available")
 
