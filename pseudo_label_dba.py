@@ -10,8 +10,8 @@ import torch
 import torch.nn.functional as F
 
 from dba_dataloader import dba_scan_sequences, DBA_FEATURE_COLS, DBA_STYLE_TO_LABEL
-from models.timemil import AmbiguousMILwithCL
-# from models.expmil import AmbiguousMILwithCL
+# from models.timemil import AmbiguousMILwithCL
+from models.expmil import AmbiguousMILwithCL
 from models.milet import MILLET
 
 
@@ -33,7 +33,6 @@ def load_ambiguous_mil(
         mDim=embed_dim,
         n_classes=num_classes,
         dropout=dropout,
-        max_seq_len=seq_len,
         is_instance=True,
     ).to(device)
 
@@ -124,7 +123,7 @@ def pseudo_label_one_sequence(
             x_win = X[start:end]  # [L, D]
             x_tensor = torch.from_numpy(x_win).unsqueeze(0).to(device)  # [1, L, D]
             if args.model == 'AmbiguousMIL':
-                bag_pred, instance_pred, x_cls, x_seq, c_seq, attn1, x_cls_proj = model(x_tensor)
+                bag_prediction, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = model(x_tensor)
             elif args.model == 'MILLET':
                 bag_prediction, non_weighted_instance_pred, instance_pred = model(x_tensor)
                 instance_pred = instance_pred.transpose(1,2)

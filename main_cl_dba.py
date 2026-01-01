@@ -420,14 +420,7 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
 
         # forward
         if args.model == 'AmbiguousMIL':
-            if epoch < args.epoch_des:
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, x_cls_proj, x_seq_proj  = milnet(
-                    bag_feats, warmup=True
-                )
-            else:
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, x_cls_proj, x_seq_proj = milnet(
-                    bag_feats, warmup=False
-                )
+            bag_prediction, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = milnet(bag_feats)
         elif args.model == 'MILLET':
             bag_prediction, non_weighted_instance_pred, instance_pred = milnet(bag_feats)
         else:
@@ -463,8 +456,8 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             #     p_bag_from_inst, bag_label.float()
             # )
             # instance_pred = torch.sigmoid(instance_pred)   # [B,T,C]
-            p_inst = instance_pred.mean(dim=1)       # [B, C]
-            inst_loss = criterion(p_inst, bag_label)
+            # p_inst = instance_pred.mean(dim=1)       # [B, C]
+            inst_loss = criterion(instance_pred, bag_label)
 
             # # ortho_loss = class_token_orthogonality_loss(x_cls)
 
@@ -588,7 +581,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             bag_label = label.to(device)   # [B, C]
 
             if args.model == 'AmbiguousMIL':
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, x_cls_proj, x_seq_proj = model(bag_feats)
+                bag_prediction, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = model(bag_feats)
             elif args.model == 'newTimeMIL':
                 out = model(bag_feats)
                 instance_pred = None
@@ -637,8 +630,8 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 #     p_bag_from_inst, bag_label.float()
                 # )
 
-                p_inst = instance_pred.mean(dim=1)       # [B, C]
-                inst_loss = criterion(p_inst, bag_label)
+                # p_inst = instance_pred.mean(dim=1)       # [B, C]
+                inst_loss = criterion(instance_pred, bag_label)
 
                 # # # class token orthogonality
                 # # ortho_loss = class_token_orthogonality_loss(x_cls)
@@ -681,7 +674,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
 
                     # AmbiguousMIL인 경우 instance_pred에서 직접 argmax
                     if args.model == 'AmbiguousMIL':
-                        pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
+                        pred_inst = torch.argmax(weighted_instance_pred, dim=2)  # [B, T]
                     elif args.model == 'newTimeMIL' and attn_layer2 is not None:
                         B, T, C = y_inst.shape
                         attn_cls = attn_layer2[:,:,:C,C:]
@@ -718,7 +711,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             total_loss += loss.item()
             
             if args.model == 'AmbiguousMIL':
-                probs = torch.sigmoid(p_inst).cpu().numpy() # p_inst is main output for evaluation
+                probs = torch.sigmoid(instance_pred).cpu().numpy() # p_inst is main output for evaluation
             else:
                 probs = torch.sigmoid(bag_prediction).cpu().numpy()
             all_probs.append(probs)
@@ -1034,7 +1027,7 @@ def main():
         base_model = newTimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len).to(device)
         proto_bank = None
     elif args.model == 'AmbiguousMIL':
-        base_model = AmbiguousMILwithCL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len, is_instance=True).to(device)
+        base_model = AmbiguousMILwithCL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, is_instance=True).to(device)
         proto_bank = PrototypeBank(
             num_classes=num_classes,
             dim=args.embed,
@@ -1319,7 +1312,7 @@ def main():
                                     dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
         elif args.model == 'AmbiguousMIL':
             eval_model = AmbiguousMILwithCL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
-                                            dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
+                                            dropout=args.dropout_node, is_instance=True).to(device)
         elif args.model == 'MILLET':
             eval_model = MILLET(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
                                 dropout=args.dropout_node, max_seq_len=args.seq_len,
