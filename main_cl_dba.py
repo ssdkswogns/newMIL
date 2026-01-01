@@ -322,8 +322,8 @@ def instance_prototype_contrastive_loss(
     S_valid = S_full.clone()
 
     # valid class: bag_label=1 AND prototype initialized
-    # valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B,1,C]
-    # S_valid = S_valid.masked_fill(~valid_class_mask, -1e9)
+    valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B,1,C]
+    S_valid = S_valid.masked_fill(~valid_class_mask, -1e9)
 
     # 3. direct non-ambiguous: per (b,t)에서 class 최대
     S_tmax, c_argmax = S_valid.max(dim=-1)  # [B,T], [B,T]
@@ -453,18 +453,18 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             instance_pred = instance_pred.transpose(1,2)
 
         if instance_pred is not None:
-            # # ---------- 기존 MIL 부분 ----------
-            # # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
-            # # eps = 1e-6
-            # # p_bag_from_inst = 1 - torch.prod(
-            # #     torch.clamp(1 - p_inst, min=eps), dim=1
-            # # )                                           # [B, C]
-            # # inst_loss = F.binary_cross_entropy(
-            # #     p_bag_from_inst, bag_label.float()
-            # # )
-            # # instance_pred = torch.sigmoid(instance_pred)   # [B,T,C]
-            # p_inst = instance_pred.mean(dim=1)       # [B, C]
-            # inst_loss = criterion(p_inst, bag_label)
+            # ---------- 기존 MIL 부분 ----------
+            # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
+            # eps = 1e-6
+            # p_bag_from_inst = 1 - torch.prod(
+            #     torch.clamp(1 - p_inst, min=eps), dim=1
+            # )                                           # [B, C]
+            # inst_loss = F.binary_cross_entropy(
+            #     p_bag_from_inst, bag_label.float()
+            # )
+            # instance_pred = torch.sigmoid(instance_pred)   # [B,T,C]
+            p_inst = instance_pred.mean(dim=1)       # [B, C]
+            inst_loss = criterion(p_inst, bag_label)
 
             # # ortho_loss = class_token_orthogonality_loss(x_cls)
 
@@ -627,18 +627,18 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 instance_pred = instance_pred.transpose(1,2)
 
             if instance_pred is not None:
-                # # # instance → bag MIL loss
-                # # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
-                # # eps = 1e-6
-                # # p_bag_from_inst = 1 - torch.prod(
-                # #     torch.clamp(1 - p_inst, min=eps), dim=1
-                # # )                                           # [B, C]
-                # # inst_loss = F.binary_cross_entropy(
-                # #     p_bag_from_inst, bag_label.float()
-                # # )
+                # # instance → bag MIL loss
+                # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
+                # eps = 1e-6
+                # p_bag_from_inst = 1 - torch.prod(
+                #     torch.clamp(1 - p_inst, min=eps), dim=1
+                # )                                           # [B, C]
+                # inst_loss = F.binary_cross_entropy(
+                #     p_bag_from_inst, bag_label.float()
+                # )
 
-                # p_inst = instance_pred.mean(dim=1)       # [B, C]
-                # inst_loss = criterion(p_inst, bag_label)
+                p_inst = instance_pred.mean(dim=1)       # [B, C]
+                inst_loss = criterion(p_inst, bag_label)
 
                 # # # class token orthogonality
                 # # ortho_loss = class_token_orthogonality_loss(x_cls)
@@ -718,7 +718,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             total_loss += loss.item()
             
             if args.model == 'AmbiguousMIL':
-                probs = torch.sigmoid(bag_prediction).cpu().numpy() # p_inst is main output for evaluation
+                probs = torch.sigmoid(p_inst).cpu().numpy() # p_inst is main output for evaluation
             else:
                 probs = torch.sigmoid(bag_prediction).cpu().numpy()
             all_probs.append(probs)

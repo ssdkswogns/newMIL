@@ -155,6 +155,72 @@ class NystromAttention(nn.Module):
 
         return out
     
+class SDPAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False,
+                 attn_drop: float = 0., proj_drop: float = 0.,
+                 use_sdpa: bool = True):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.use_sdpa = use_sdpa  # PyTorch 2.x required for scaled_dot_product_attention
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop_p = attn_drop
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, mask=None):
+        """
+        x:   (B, N, C)
+        mask: (B, N)  # True=유효, False=패딩 (optional)
+        """
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)       # (3, B, H, N, D)
+        q, k, v = qkv[0], qkv[1], qkv[2]       # (B, H, N, D)
+
+        if self.use_sdpa:
+            # --- SDPA / FlashAttention 경로 ---
+            # PyTorch의 bool mask는 True=사용, False=마스킹
+            attn_mask = None
+            if mask is not None:
+                # 현재 구현에서 mask: True=유효이므로 그대로 사용
+                # q,k,v shape: (B,H,N,D) → batch_dim이 첫 번째이므로
+                # attn_mask는 (B, 1, N, N) 또는 (B, N) 등 허용되는 형식 중 하나를 써야 합니다.
+                # 여기서는 (B, 1, 1, N) 브로드캐스트 형식을 사용합니다.
+                attn_mask = mask[:, None, None, :]  # (B,1,1,N), bool
+
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop_p if self.training else 0.0,
+                is_causal=False,
+            )  # (B, H, N, D)
+
+            out = out.transpose(1, 2).reshape(B, N, C)
+            out = self.proj(out)
+            out = self.proj_drop(out)
+            return out
+
+        # --- fallback: 기존 naive 경로 (SDPA 사용 안 하는 경우) ---
+        q = q * (self.head_dim ** -0.5)
+        attn = q @ k.transpose(-2, -1)         # (B,H,N,N)
+
+        if mask is not None:
+            mask_ = mask[:, None, None, :].to(torch.bool)
+            mask_val = -torch.finfo(attn.dtype).max
+            attn = attn.masked_fill(~mask_, mask_val)
+
+        attn = attn.softmax(dim=-1)
+        attn = F.dropout(attn, p=self.attn_drop_p, training=self.training)
+        out = attn @ v                          # (B,H,N,D)
+
+        out = out.transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False,
                  attn_drop: float = 0., proj_drop: float = 0.,

@@ -223,7 +223,7 @@ class AmbiguousMILwithCL(nn.Module):
         logits = torch.mean(weighted_instance_logits, dim=1)
 
         # 3. Bag-level logits (GAP over time in logit space)
-        logits = instance_logits.mean(dim=1)                 # [B, C]
+        # logits = instance_logits.mean(dim=1)                 # [B, C]
 
         # 4. Per-class attention: x_seq -> score -> softmax over time
         #    score: [B, T, C]
@@ -235,6 +235,7 @@ class AmbiguousMILwithCL(nn.Module):
         # 5. Attention-weighted class prototypes x_cls: [B, C, D]
         #    batched matmul: (B, C, T) x (B, T, D) -> (B, C, D)
         x_cls = torch.bmm(attn, x_seq)                       # [B, C, D]
+        logits = x_cls.mean(dim=-1)                           # [B, C]
 
         # 6. Contrastive projections (for proto CL)
         x_seq_proj = None

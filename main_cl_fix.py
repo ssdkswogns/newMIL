@@ -832,9 +832,9 @@ def main():
                         help='temperature for context contrastive loss')
 
     parser.add_argument('--batchsize', default=64, type=int, help='batchsize')
-    parser.add_argument('--proto_tau', type=float, default=0.2,
+    parser.add_argument('--proto_tau', type=float, default=0.1,
                         help='temperature for instance-prototype contrastive loss')
-    parser.add_argument('--proto_sim_thresh', type=float, default=0.5,
+    parser.add_argument('--proto_sim_thresh', type=float, default=0.7,
                         help='similarity threshold to treat instance as confident')
     parser.add_argument('--proto_win', type=int, default=5,
                         help='temporal neighbor window for ambiguous instances')
