@@ -22,7 +22,7 @@ class PositionalEncoding(nn.Module):
     https://pytorch.org/tutorials/beginner/transformer_tutorial.html
     """
 
-    def __init__(self, d_model: int, max_len: int = 5000) -> None:
+    def __init__(self, d_model: int, max_len: int = 100000) -> None:
         super().__init__()
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))

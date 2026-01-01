@@ -10,7 +10,9 @@ import torch
 import torch.nn.functional as F
 
 from dba_dataloader import dba_scan_sequences, DBA_FEATURE_COLS, DBA_STYLE_TO_LABEL
-from models.timemil import AmbiguousMILwithCL
+# from models.timemil import AmbiguousMILwithCL
+from models.expmil import AmbiguousMILwithCL
+from models.milet import MILLET
 
 
 def load_ambiguous_mil(
@@ -40,9 +42,37 @@ def load_ambiguous_mil(
     model.eval()
     return model
 
+def load_millet(
+    ckpt_path: str,
+    feats_size: int,
+    num_classes: int,
+    seq_len: int,
+    embed_dim: int,
+    dropout: float,
+    device: torch.device,
+):
+    """
+    학습된 AmbiguousMILwithCL 모델 로드 (is_instance=True).
+    main_cl_fix.py에서 eval할 때 쓰신 생성자와 동일한 형태로 맞춤.
+    """
+    model = MILLET(
+        feats_size,              # in_features
+        mDim=embed_dim,
+        n_classes=num_classes,
+        dropout=dropout,
+        max_seq_len=seq_len,
+        is_instance=True,
+    ).to(device)
+
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
 
 @torch.no_grad()
 def pseudo_label_one_sequence(
+    args,
     model,
     df: pd.DataFrame,
     feature_cols,
@@ -71,7 +101,12 @@ def pseudo_label_one_sequence(
     if T <= window_size:
         # 너무 짧은 경우: 한 번만 통째로 넣음 (padding이 필요하면 여기서 추가)
         x_tensor = torch.from_numpy(X).unsqueeze(0).to(device)  # [1, T, D]
-        bag_pred, instance_pred, x_cls, x_seq, c_seq, attn1, attn2 = model(x_tensor)
+        if args.model == 'AmbiguousMIL':
+            bag_pred, instance_pred, x_cls, x_seq, c_seq, attn1, x_cls_proj, x_seq_proj = model(x_tensor)
+        elif args.model == 'MILLET':
+            bag_prediction, non_weighted_instance_pred, instance_pred = model(x_tensor)
+            instance_pred = instance_pred.transpose(1,2)
+
         p_inst = torch.sigmoid(instance_pred)[0].cpu().numpy()   # [T, C]
 
         prob_sum[:T] += p_inst
@@ -88,8 +123,11 @@ def pseudo_label_one_sequence(
             end = start + window_size
             x_win = X[start:end]  # [L, D]
             x_tensor = torch.from_numpy(x_win).unsqueeze(0).to(device)  # [1, L, D]
-
-            bag_pred, instance_pred, x_cls, x_seq, c_seq, attn1, attn2 = model(x_tensor)
+            if args.model == 'AmbiguousMIL':
+                bag_pred, instance_pred, x_cls, x_seq, c_seq, attn1, x_cls_proj, x_seq_proj = model(x_tensor)
+            elif args.model == 'MILLET':
+                bag_prediction, non_weighted_instance_pred, instance_pred = model(x_tensor)
+                instance_pred = instance_pred.transpose(1,2)
             p_inst = torch.sigmoid(instance_pred)[0].cpu().numpy()  # [L, C]
 
             prob_sum[start:end] += p_inst
@@ -123,6 +161,8 @@ def main():
                         help='학습 시 사용한 --dropout_node 값')
     parser.add_argument('--gpu', type=int, default=0,
                         help='사용할 GPU index')
+    parser.add_argument('--model', type=str, default='AmbiguousMIL',
+                        help='사용할 GPU index')
     args = parser.parse_args()
 
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
@@ -131,16 +171,26 @@ def main():
     feats_size  = len(DBA_FEATURE_COLS)   # feature dimension
     seq_len     = args.window_size       # max_seq_len은 학습 때 dba_window와 동일
 
-    # 1) 모델 로드
-    model = load_ambiguous_mil(
-        ckpt_path=args.ckpt,
-        feats_size=feats_size,
-        num_classes=num_classes,
-        seq_len=seq_len,
-        embed_dim=args.embed,
-        dropout=args.dropout,
-        device=device,
-    )
+    if args.model == 'AmbiguousMIL':
+        model = load_ambiguous_mil(
+            ckpt_path=args.ckpt,
+            feats_size=feats_size,
+            num_classes=num_classes,
+            seq_len=seq_len,
+            embed_dim=args.embed,
+            dropout=args.dropout,
+            device=device,
+        )
+    elif args.model == 'MILLET':
+        model = load_millet(
+            ckpt_path=args.ckpt,
+            feats_size=feats_size,
+            num_classes=num_classes,
+            seq_len=seq_len,
+            embed_dim=args.embed,
+            dropout=args.dropout,
+            device=device,
+        )
 
     # 2) 시퀀스 스캔 (원본 CSV 경로 + style label)
     seq_list = dba_scan_sequences(args.dba_root)
@@ -155,6 +205,7 @@ def main():
         df = pd.read_csv(csv_path)
 
         prob, pseudo_label = pseudo_label_one_sequence(
+            args=args,
             model=model,
             df=df,
             feature_cols=DBA_FEATURE_COLS,

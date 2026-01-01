@@ -29,7 +29,7 @@ DBA_FEATURE_COLS = [
     "imu_acc_long", "imu_acc_lat", "imu_yaw_rate","imu_roll_rate",
     "odom_vx", # 차량 속도
     "odom_wz", # 차량 각속도
-    "scc_obj_relspd", "scc_obj_dst",
+    "scc_obj_relspd", "scc_obj_dst", "lead_present"
 ]
 
 

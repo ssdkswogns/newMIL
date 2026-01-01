@@ -453,44 +453,44 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             instance_pred = instance_pred.transpose(1,2)
 
         if instance_pred is not None:
-            # ---------- 기존 MIL 부분 ----------
-            # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
-            # eps = 1e-6
-            # p_bag_from_inst = 1 - torch.prod(
-            #     torch.clamp(1 - p_inst, min=eps), dim=1
-            # )                                           # [B, C]
-            # inst_loss = F.binary_cross_entropy(
-            #     p_bag_from_inst, bag_label.float()
-            # )
-            # instance_pred = torch.sigmoid(instance_pred)   # [B,T,C]
-            p_inst = instance_pred.mean(dim=1)       # [B, C]
-            inst_loss = criterion(p_inst, bag_label)
+            # # ---------- 기존 MIL 부분 ----------
+            # # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
+            # # eps = 1e-6
+            # # p_bag_from_inst = 1 - torch.prod(
+            # #     torch.clamp(1 - p_inst, min=eps), dim=1
+            # # )                                           # [B, C]
+            # # inst_loss = F.binary_cross_entropy(
+            # #     p_bag_from_inst, bag_label.float()
+            # # )
+            # # instance_pred = torch.sigmoid(instance_pred)   # [B,T,C]
+            # p_inst = instance_pred.mean(dim=1)       # [B, C]
+            # inst_loss = criterion(p_inst, bag_label)
 
-            # ortho_loss = class_token_orthogonality_loss(x_cls)
+            # # ortho_loss = class_token_orthogonality_loss(x_cls)
 
-            pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
-            instance_pred_s = torch.sigmoid(instance_pred)
-            p_inst_s = instance_pred_s.mean(dim=1)
-            sparsity_per_class = p_inst_s.mean(dim=(0, 1))    # [C]
-            if pos_mask.sum() > 0:
-                sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
-                    pos_mask.sum() + 1e-6
-                )
-            else:
-                sparsity_loss = torch.tensor(0.0, device=device)
-            sparsity_loss = sparsity_per_class.mean()
+            # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+            # instance_pred_s = torch.sigmoid(instance_pred)
+            # p_inst_s = instance_pred_s.mean(dim=1)
+            # sparsity_per_class = p_inst_s.mean(dim=(0, 1))    # [C]
+            # if pos_mask.sum() > 0:
+            #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
+            #         pos_mask.sum() + 1e-6
+            #     )
+            # else:
+            #     sparsity_loss = torch.tensor(0.0, device=device)
+            # sparsity_loss = sparsity_per_class.mean()
 
-            diff = instance_pred[:, 1:, :] - instance_pred[:, :-1, :]   # [B, T-1, C]
-            diff = diff * pos_mask[None, None, :]
-            smooth_loss = (diff ** 2).mean()
+            # diff = instance_pred[:, 1:, :] - instance_pred[:, :-1, :]   # [B, T-1, C]
+            # diff = diff * pos_mask[None, None, :]
+            # smooth_loss = (diff ** 2).mean()
 
             # ---------- prototype 기반 instance CL ----------
             if (epoch >= args.epoch_des) and (proto_bank is not None) and args.model == 'AmbiguousMIL':
-                proto_bank.update(x_cls_proj.detach(), bag_label)
+                proto_bank.update(x_cls.detach(), bag_label)
                 if world_size > 1:
                     proto_bank.sync(world_size)
                 proto_inst_loss = instance_prototype_contrastive_loss(
-                    x_seq_proj,
+                    x_seq,
                     bag_label,
                     proto_bank,
                     tau=getattr(args, "proto_tau", 0.1),
@@ -627,44 +627,44 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 instance_pred = instance_pred.transpose(1,2)
 
             if instance_pred is not None:
-                # # instance → bag MIL loss
-                # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
-                # eps = 1e-6
-                # p_bag_from_inst = 1 - torch.prod(
-                #     torch.clamp(1 - p_inst, min=eps), dim=1
-                # )                                           # [B, C]
-                # inst_loss = F.binary_cross_entropy(
-                #     p_bag_from_inst, bag_label.float()
-                # )
+                # # # instance → bag MIL loss
+                # # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
+                # # eps = 1e-6
+                # # p_bag_from_inst = 1 - torch.prod(
+                # #     torch.clamp(1 - p_inst, min=eps), dim=1
+                # # )                                           # [B, C]
+                # # inst_loss = F.binary_cross_entropy(
+                # #     p_bag_from_inst, bag_label.float()
+                # # )
 
-                p_inst = instance_pred.mean(dim=1)       # [B, C]
-                inst_loss = criterion(p_inst, bag_label)
+                # p_inst = instance_pred.mean(dim=1)       # [B, C]
+                # inst_loss = criterion(p_inst, bag_label)
 
-                # # class token orthogonality
-                # ortho_loss = class_token_orthogonality_loss(x_cls)
+                # # # class token orthogonality
+                # # ortho_loss = class_token_orthogonality_loss(x_cls)
 
-                # 이번 배치에서 실제로 등장한 positive class만 선택
-                pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
-                instance_pred_s = torch.sigmoid(instance_pred)
-                p_inst_s = instance_pred_s.mean(dim=1)
-                sparsity_per_class = p_inst_s.mean(dim=(0, 1))    # [C]
-                if pos_mask.sum() > 0:
-                    sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
-                        pos_mask.sum() + 1e-6
-                    )
-                else:
-                    sparsity_loss = torch.tensor(0.0, device=device)
-                sparsity_loss = sparsity_per_class.mean()
+                # # 이번 배치에서 실제로 등장한 positive class만 선택
+                # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+                # instance_pred_s = torch.sigmoid(instance_pred)
+                # p_inst_s = instance_pred_s.mean(dim=1)
+                # sparsity_per_class = p_inst_s.mean(dim=(0, 1))    # [C]
+                # if pos_mask.sum() > 0:
+                #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
+                #         pos_mask.sum() + 1e-6
+                #     )
+                # else:
+                #     sparsity_loss = torch.tensor(0.0, device=device)
+                # sparsity_loss = sparsity_per_class.mean()
 
-                # temporal smoothness loss
-                diff = instance_pred[:, 1:, :] - instance_pred[:, :-1, :]   # [B, T-1, C]
-                diff = diff * pos_mask[None, None, :]         # broadcast
-                smooth_loss = (diff ** 2).mean()
+                # # temporal smoothness loss
+                # diff = instance_pred[:, 1:, :] - instance_pred[:, :-1, :]   # [B, T-1, C]
+                # diff = diff * pos_mask[None, None, :]         # broadcast
+                # smooth_loss = (diff ** 2).mean()
 
                 # prototype 기반 instance CL (eval에서는 update 없이 loss만)
                 if (epoch >= args.epoch_des) and (proto_bank is not None) and args.model == 'AmbiguousMIL':
                     proto_inst_loss = instance_prototype_contrastive_loss(
-                        x_seq_proj,
+                        x_seq,
                         bag_label,
                         proto_bank,
                         tau=getattr(args, "proto_tau", 0.1),
