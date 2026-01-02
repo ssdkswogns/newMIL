@@ -20,9 +20,10 @@ try:
 except Exception:
     DEFAULT_FEATURE_COLS = [
         "imu_acc_long", "imu_acc_lat", "imu_yaw_rate","imu_roll_rate",
-        "odom_vx", # 차량 속도
-        "odom_wz", # 차량 각속도
-        "scc_obj_relspd", "scc_obj_dst",
+        "odom_vx",
+        "odom_wz",
+        "radar_obj_relspd",
+        "radar_obj_dst",
     ]
     DEFAULT_LABEL_NAMES = ["aggressive", "conservative", "normal"]
 
@@ -34,7 +35,7 @@ PSEUDO_PROB_COLS = [
 ]
 PSEUDO_CLASSES = ["aggressive", "conservative", "normal"]
 LOW_CONF_LABEL = "low_conf"
-LOW_CONF_THRESH = 0.1   # 세 확률 모두 이 값 미만이면 low_conf로 처리
+LOW_CONF_THRESH = 0.5   # 세 확률 모두 이 값 미만이면 low_conf로 처리
 
 
 def parse_args():
@@ -123,7 +124,21 @@ def plot_sequence_with_pseudo(
 
     # 1) 사용할 feature 선택
     if feature_cols is None:
-        feature_cols = [c for c in DEFAULT_FEATURE_COLS if c in df.columns]
+        feature_cols = []
+        col_map = {}   # 표시이름 -> 실제 df 컬럼
+
+        for c in DEFAULT_FEATURE_COLS:
+            if c in df.columns:
+                feature_cols.append(c)
+                col_map[c] = c
+
+            elif c == "radar_obj_relspd" and "scc_obj_relspd" in df.columns:
+                feature_cols.append("radar_obj_relspd")
+                col_map["radar_obj_relspd"] = "scc_obj_relspd"
+
+            elif c == "radar_obj_dst" and "scc_obj_dst" in df.columns:
+                feature_cols.append("radar_obj_dst")
+                col_map["radar_obj_dst"] = "scc_obj_dst"
 
     if len(feature_cols) == 0:
         raise ValueError("플롯할 feature 컬럼이 없습니다. --features 또는 DEFAULT_FEATURE_COLS를 확인하세요.")
@@ -137,7 +152,10 @@ def plot_sequence_with_pseudo(
         t = np.arange(len(df))
 
     # 3) feature 값
-    y_dict = {feat: df[feat].values for feat in feature_cols}
+    y_dict = {}
+    for feat in feature_cols:
+        real_col = col_map.get(feat, feat)
+        y_dict[feat] = df[real_col].values
 
     # 4) pseudo prob → pseudo label_str 재계산
     #    probs: [T, 3]

@@ -18,6 +18,7 @@ from mydataload import loadorean
 
 from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL
 from models.expmil import AmbiguousMILwithCL
+from models.milet import MILLET
 
 warnings.filterwarnings("ignore")
 
@@ -148,6 +149,9 @@ def compute_classwise_aopcr(
             logits, x_cls, attn_layer1, attn_layer2 = out
             prob = torch.sigmoid(logits)
             instance_logits = None
+        elif args.model == 'MILLET':
+            logits, non_weighted_instance_logit, instance_logits = milnet(x)
+            prob = torch.sigmoid(logits)
         else:
             raise ValueError(f"Unknown model name: {args.model}")
 
@@ -175,6 +179,13 @@ def compute_classwise_aopcr(
                     # s_all = torch.softmax(instance_logits[b], dim=-1)   # [T, C]
                     s_all = instance_logits[b]   # [T, C]
                     scores = s_all[:, pred_c]                           # [T]
+                elif args.model == 'MILLET':
+                    # if instance_logits is not None: # [B, C, T]
+                    #     scores = instance_logits[b, pred_c, :]
+                    #     scores = torch.softmax(instance_logits[b], dim=1)[pred_c,:]  # [T]
+                    if instance_logits is not None: # [B, T, C]
+                        scores = instance_logits[b, :, pred_c]
+                        # scores = torch.softmax(instance_logits[b], dim=1)[:,pred_c]  # [T]
                 else:
                     # TimeMIL / newTimeMIL: class-token → time-token attention 기반
                     scores = extract_attn_importance(

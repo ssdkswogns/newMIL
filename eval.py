@@ -11,6 +11,7 @@ import sys
 import warnings
 from typing import Dict, List, Optional
 
+from dba_dataloader import build_dba_for_timemil
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,8 +28,12 @@ from aeon.datasets import load_classification
 from syntheticdataset import MixedSyntheticBagsConcatK
 from utils import *
 from mydataload import loadorean
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMILwithCL
+from models.timemil import TimeMIL, newTimeMIL
+from models.expmil import AmbiguousMILwithCL
+from models.milet import MILLET
 from compute_aopcr import compute_classwise_aopcr
+
+from dba_dataloader import build_dba_for_timemil, build_dba_windows_for_mixed
 
 warnings.filterwarnings("ignore")
 
@@ -65,6 +70,11 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
                     raise ValueError("Unexpected AmbiguousMIL output")
                 logits, instance_pred = out[0], out[1]
                 attn_layer2 = out[-1]
+            elif args.model == 'MILLET':
+                if not isinstance(out, (tuple, list)) or len(out) < 3:
+                    raise ValueError("Unexpected MILLET output")
+                # MILLET returns (bag_logits, instance_logits[B,T,C], interpretation[B,C,T])
+                logits, non_weighted_instance_pred, instance_pred = out
             else:
                 if not isinstance(out, (tuple, list)) or len(out) < 4:
                     raise ValueError("Unexpected model output")
@@ -83,6 +93,8 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
             attn_mean = attn_cls.mean(dim=1)
 
             if args.model == 'AmbiguousMIL' and instance_pred is not None:
+                pred_inst = torch.argmax(instance_pred, dim=2).cpu()
+            elif args.model == 'MILLET' and instance_pred is not None:
                 pred_inst = torch.argmax(instance_pred, dim=2).cpu()
             else:
                 pred_inst = torch.argmax(attn_mean, dim=1).cpu()
@@ -173,6 +185,36 @@ def build_datasets(args):
         else:
             class_names = [str(i) for i in range(num_classes)]
         return testset, class_names, seq_len, num_classes, L_in
+    
+    elif args.dataset == 'dba':
+        if args.datatype == 'original':
+            # window 하나가 bag이 되는 기존 방식
+            trainset, testset, seq_len, num_classes, L_in = build_dba_for_timemil(args)
+
+        elif args.datatype == 'mixed':
+            # window 단위로 잘라서 concat-bag 을 만드는 방식
+            Xtr, ytr_idx, Xte, yte_idx, seq_len, num_classes, L_in = build_dba_windows_for_mixed(args)
+
+            trainset = MixedSyntheticBagsConcatK(
+                X=Xtr,
+                y_idx=ytr_idx,
+                num_classes=num_classes,
+                total_bags=len(Xtr),
+                concat_k=2,
+                seed=args.seed,
+            )
+            testset = MixedSyntheticBagsConcatK(
+                X=Xte,
+                y_idx=yte_idx,
+                num_classes=num_classes,
+                total_bags=len(Xte),
+                concat_k=2,
+                seed=args.seed+1,
+                return_instance_labels=True,
+            )
+
+        class_names = [str(i) for i in range(num_classes)]
+        return testset, class_names, seq_len, num_classes, L_in
 
     Xtr, ytr, meta = load_classification(name=args.dataset, split='train', extract_path='./data')
     Xte, yte, _ = load_classification(name=args.dataset, split='test', extract_path='./data')
@@ -224,6 +266,13 @@ def build_model(args, seq_len, num_classes, device):
                                     n_classes=num_classes,
                                     dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
                                     max_seq_len=seq_len, is_instance=True).to(device)
+    elif args.model == 'MILLET':
+        milnet = MILLET(args.feats_size, mDim=args.embed,
+                        n_classes=num_classes,
+                        dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
+                        max_seq_len=seq_len,
+                        pooling=getattr(args, "millet_pooling", "conjunctive"),
+                        is_instance=True).to(device)
     else:
         raise Exception("Model not available")
     return milnet
@@ -249,6 +298,11 @@ def main():
     parser.add_argument('--cls_threshold', default=0.5, type=float, help='Threshold for multi-label classification metrics')
     parser.add_argument('--datatype', default="mixed", type=str, help='Choose datatype between original and mixed')
 
+    parser.add_argument('--dba_root', type=str, default='./data/dba_data', help='Root directory of DBA dataset (1_xxx/aggressive/... 구조)')
+    parser.add_argument('--dba_window', type=int, default=50, help='Sliding window length (time steps) for DBA dataset')
+    parser.add_argument('--dba_stride', type=int, default=10, help='Sliding window stride for DBA dataset')
+    parser.add_argument('--dba_test_ratio', type=float, default=0.2, help='Train/Test split ratio (sequence-level) for DBA dataset')
+
     args = parser.parse_args()
     gpu_ids = tuple(args.gpu_index)
     os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(x) for x in gpu_ids)
@@ -267,7 +321,7 @@ def main():
 
     # DataLoader
     testloader = DataLoader(
-        testset, batch_size=16, shuffle=False,
+        testset, batch_size=1, shuffle=False,
         num_workers=args.num_workers, drop_last=False, pin_memory=True
     )
 

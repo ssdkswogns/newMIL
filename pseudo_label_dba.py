@@ -101,12 +101,12 @@ def pseudo_label_one_sequence(
         # 너무 짧은 경우: 한 번만 통째로 넣음 (padding이 필요하면 여기서 추가)
         x_tensor = torch.from_numpy(X).unsqueeze(0).to(device)  # [1, T, D]
         if args.model == 'AmbiguousMIL':
-            bag_pred, instance_pred, x_cls, x_seq, c_seq, attn1, x_cls_proj = model(x_tensor)
+            bag_prediction, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = model(x_tensor)
+            p_inst = torch.sigmoid(weighted_instance_pred)[0].cpu().numpy()   # [T, C]
         elif args.model == 'MILLET':
             bag_prediction, non_weighted_instance_pred, instance_pred = model(x_tensor)
             instance_pred = instance_pred.transpose(1,2)
-
-        p_inst = torch.sigmoid(instance_pred)[0].cpu().numpy()   # [T, C]
+            p_inst = torch.sigmoid(instance_pred)[0].cpu().numpy()   # [T, C]        
 
         prob_sum[:T] += p_inst
         count[:T] += 1
@@ -124,10 +124,12 @@ def pseudo_label_one_sequence(
             x_tensor = torch.from_numpy(x_win).unsqueeze(0).to(device)  # [1, L, D]
             if args.model == 'AmbiguousMIL':
                 bag_prediction, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = model(x_tensor)
+                p_inst = torch.sigmoid(weighted_instance_pred)[0].cpu().numpy()  # [L, C]
             elif args.model == 'MILLET':
                 bag_prediction, non_weighted_instance_pred, instance_pred = model(x_tensor)
                 instance_pred = instance_pred.transpose(1,2)
-            p_inst = torch.sigmoid(instance_pred)[0].cpu().numpy()  # [L, C]
+                p_inst = torch.sigmoid(instance_pred)[0].cpu().numpy()  # [L, C]
+            
 
             prob_sum[start:end] += p_inst
             count[start:end] += 1
@@ -161,7 +163,7 @@ def main():
     parser.add_argument('--gpu', type=int, default=0,
                         help='사용할 GPU index')
     parser.add_argument('--model', type=str, default='AmbiguousMIL',
-                        help='사용할 GPU index')
+                        help='사용할 model')
     args = parser.parse_args()
 
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
