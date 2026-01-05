@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run AmbiguousMIL with contrastive proto loss (cl_w=0.4) and equal bag/instance weights.
+# Run AmbiguousMIL with CL ramp (ramp engine) using the same hparams as run_ambi_cl.sh for fair comparison.
 
 DATASETS=(
   "ArticularyWordRecognition"
@@ -10,19 +10,20 @@ DATASETS=(
 )
 
 for d in "${DATASETS[@]}"; do
-  echo "Running AmbiguousMIL + CL on dataset: $d"
-  python3 main_cl_fix_ambiguous.py \
+  echo "Running AmbiguousMIL + CL (ramp) on dataset: $d"
+  python3 main_cl_fix_ramp.py \
     --dataset "$d" \
     --datatype mixed \
     --model AmbiguousMIL \
-    --epoch_des 20 \
+    --epoch_des 40 \
     --num_epochs 1500 \
     --bag_loss_w 0.3 \
     --inst_loss_w 0.3 \
     --proto_loss_w 0.4 \
     --lr 5e-3 \
-    --epoch_des 50 \
-    --batchsize 256
+    --proto_ramp_start 50 \
+    --proto_ramp_len 30 \
+    --batch_size 256
 
   echo "Done: $d"
   echo
