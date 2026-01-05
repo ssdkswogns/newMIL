@@ -37,6 +37,10 @@ import warnings
 
 from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
 from models.milet import MILLET
+from models.MLSTM_FCN import MLSTM_FCN
+from models.os_cnn import OS_CNN
+from models.ED_1NN import ED1NN
+from models.DTW_1NN_torch import dtw_1nn_D_predict_torch, dtw_1nn_I_predict_torch
 from compute_aopcr import compute_classwise_aopcr
 
 from os.path import join
@@ -420,6 +424,15 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         if args.model == 'MILLET':
             bag_prediction, instance_pred, interpretation = milnet(bag_feats)
             x_cls, x_seq = None, None
+        elif args.model == 'OS_CNN':
+            out = milnet(bag_feats, return_cam=True)
+            bag_prediction, interpretation = out
+            instance_pred = None
+            x_cls, x_seq = None, None
+        elif args.model == 'MLSTM_FCN':
+            bag_prediction = milnet(bag_feats)
+            instance_pred = None
+            x_cls, x_seq = None, None
         elif args.model == 'AmbiguousMIL':
             if epoch < args.epoch_des:
                 bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(
@@ -587,6 +600,16 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 bag_prediction, instance_pred, interpretation = model(bag_feats)
                 attn_layer2 = None
                 x_seq = None
+            elif args.model == 'OS_CNN':
+                out = model(bag_feats, return_cam=True)
+                bag_prediction, interpretation = out
+                instance_pred = None
+                attn_layer2 = None
+            elif args.model == 'MLSTM_FCN':
+                out = model(bag_feats)
+                bag_prediction = out if not isinstance(out, (tuple, list)) else out[0]
+                instance_pred = None
+                attn_layer2 = None
             elif args.model == 'newTimeMIL':
                 out = model(bag_feats)
                 instance_pred = None
@@ -807,11 +830,16 @@ def main():
     parser.add_argument('--dropout_patch', default=0.5, type=float, help='Patch dropout rate [0] 0.5')
     parser.add_argument('--dropout_node', default=0.2, type=float, help='Bag classifier dropout rate [0]')
     parser.add_argument('--seed', default=0, type=int, help='random seed')
-    parser.add_argument('--model', default='TimeMIL', type=str, help='MIL model')
+    parser.add_argument('--model', default='TimeMIL', type=str,
+                        help='Model (TimeMIL | newTimeMIL | AmbiguousMIL | MILLET | MLSTM_FCN | OS_CNN | ED1NN | DTW1NN_D | DTW1NN_I)')
     parser.add_argument('--prepared_npz', type=str, default='./data/PAMAP2.npz', help='전처리 결과 npz 경로 (예: ./data/PAMAP2.npz)')
     parser.add_argument('--optimizer', default='adamw', type=str, help='adamw sgd')
     parser.add_argument('--millet_pooling', default='conjunctive', type=str,
                         help="Pooling for MILLET (conjunctive | attention | instance | additive | gap)")
+    parser.add_argument('--ed1nn_normalize', action='store_true', help='Z-score features before running ED1NN baseline')
+    parser.add_argument('--dtw_window', type=int, default=None, help='Sakoe-Chiba window for DTW baselines (None = full)')
+    parser.add_argument('--dtw_max_train', type=int, default=None, help='Limit DTW baselines to first N train samples')
+    parser.add_argument('--dtw_max_test', type=int, default=None, help='Limit DTW baselines to first N test samples')
 
     parser.add_argument('--save_dir', default='./savemodel/', type=str, help='the directory used to save all the output')
     parser.add_argument('--epoch_des', default=20, type=int, help='turn on warmup')
@@ -833,8 +861,8 @@ def main():
     parser.add_argument('--bag_loss_w', type=float, default=0.5, help='weight for bag-level loss')
     parser.add_argument('--inst_loss_w', type=float, default=0.2, help='weight for instance-level MIL loss')
     parser.add_argument('--ortho_loss_w', type=float, default=0.0, help='weight for class token orthogonality loss')
-    parser.add_argument('--smooth_loss_w', type=float, default=0.05, help='weight for temporal smoothness loss')
-    parser.add_argument('--sparsity_loss_w', type=float, default=0.05, help='weight for sparsity loss')
+    parser.add_argument('--smooth_loss_w', type=float, default=0.00, help='weight for temporal smoothness loss')
+    parser.add_argument('--sparsity_loss_w', type=float, default=0.00, help='weight for sparsity loss')
     parser.add_argument('--ctx_contrast_w', type=float, default=0.0, help='weight for context contrastive loss')
     parser.add_argument('--proto_loss_w', type=float, default=0.2, help='weight for prototype instance contrastive loss')
     parser.add_argument('--cls_contrast_tau', type=float, default=0.1, help='temperature for batch class embedding contrastive loss')
@@ -932,22 +960,30 @@ def main():
 
         # aeon 버전에 따라 meta가 없는 경우가 있어 대응
         if len(res_tr) == 3:
-            Xtr, ytr, meta = res_tr
+            Xtr_np, ytr, meta = res_tr
         else:
-            Xtr, ytr = res_tr
+            Xtr_np, ytr = res_tr
             meta = {'class_values': np.unique(ytr)}
 
         if len(res_te) == 3:
-            Xte, yte, _meta_unused = res_te
+            Xte_np, yte, _meta_unused = res_te
         else:
-            Xte, yte = res_te
+            Xte_np, yte = res_te
+
+        # Optional DTW train/test subsampling for speed
+        if args.dtw_max_train is not None:
+            Xtr_np = Xtr_np[:args.dtw_max_train]
+            ytr = ytr[:args.dtw_max_train]
+        if args.dtw_max_test is not None:
+            Xte_np = Xte_np[:args.dtw_max_test]
+            yte = yte[:args.dtw_max_test]
 
         word_to_idx = {cls:i for i, cls in enumerate(meta['class_values'])}
         ytr_idx = torch.tensor([word_to_idx[i] for i in ytr], dtype=torch.long)
         yte_idx = torch.tensor([word_to_idx[i] for i in yte], dtype=torch.long)
 
-        Xtr = torch.from_numpy(Xtr).permute(0,2,1).float()
-        Xte = torch.from_numpy(Xte).permute(0,2,1).float()
+        Xtr = torch.from_numpy(Xtr_np).permute(0,2,1).float()
+        Xte = torch.from_numpy(Xte_np).permute(0,2,1).float()
 
         num_classes = len(meta['class_values'])
         args.num_classes = num_classes
@@ -981,6 +1017,55 @@ def main():
             print(f'num class: {args.num_classes}')
             print(f'total_len: {SYN_TOTAL_LEN}')
 
+    # --------- 1NN baselines (original data only) ---------
+    if args.model in ['ED1NN', 'DTW1NN_D', 'DTW1NN_I']:
+        if args.datatype != 'original':
+            raise ValueError(f"{args.model} baseline supports only datatype=original (single-label).")
+        # These baselines currently rely on aeon datasets (Xtr_np/Xte_np defined above)
+        if 'Xtr_np' not in locals():
+            raise ValueError(f"{args.model} baseline is only supported for aeon datasets loaded via load_classification.")
+
+        if is_main:
+            y_train_np = ytr_idx.numpy()
+            y_test_np = yte_idx.numpy()
+
+        if args.model == 'ED1NN':
+            clf = ED1NN(normalize=args.ed1nn_normalize)
+            clf.fit(Xtr_np, y_train_np)
+            y_pred = clf.predict(Xte_np)
+        elif args.model == 'DTW1NN_I':
+            y_pred = dtw_1nn_I_predict_torch(
+                Xtr_np, y_train_np, Xte_np, device=device, window=args.dtw_window
+            )
+        else:  # DTW1NN_D
+            y_pred = dtw_1nn_D_predict_torch(
+                Xtr_np, y_train_np, Xte_np, device=device, window=args.dtw_window
+            )
+
+            acc = accuracy_score(y_test_np, y_pred)
+            bal_acc = balanced_accuracy_score(y_test_np, y_pred)
+            f1_ma = f1_score(y_test_np, y_pred, average='macro')
+
+            print(f"[{args.model}] Dataset: {args.dataset}")
+            print(f"Train: {Xtr_np.shape} | Test: {Xte_np.shape}")
+            print(f"Accuracy:          {acc:.4f}")
+            print(f"Balanced Accuracy: {bal_acc:.4f}")
+            print(f"F1 (macro):        {f1_ma:.4f}")
+
+            if wandb.run is not None:
+                wandb.log({
+                    "score/acc": acc,
+                    "score/bal_acc": bal_acc,
+                    "score/f1_macro": f1_ma,
+                })
+            if logger is not None:
+                logger.info(
+                    ('[%s] Acc=%.4f BalAcc=%.4f F1(Ma)=%.4f') %
+                    (args.model, acc, bal_acc, f1_ma)
+                )
+        cleanup_distributed()
+        return
+
     # ---------------- 모델 구성 ----------------
     if args.model =='TimeMIL':
         base_model = TimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len).to(device)
@@ -1000,6 +1085,20 @@ def main():
         base_model = MILLET(args.feats_size, mDim=args.embed, n_classes=num_classes,
                             dropout=args.dropout_node, max_seq_len=seq_len,
                             pooling=args.millet_pooling, is_instance=True).to(device)
+        proto_bank = None
+    elif args.model == 'OS_CNN':
+        base_model = OS_CNN(
+            in_channels=args.feats_size,
+            n_class=num_classes,
+            layer_parameter_list=None,
+            few_shot=False
+        ).to(device)
+        proto_bank = None
+    elif args.model == 'MLSTM_FCN':
+        base_model = MLSTM_FCN(
+            input_dim=args.feats_size,
+            num_classes=num_classes,
+        ).to(device)
         proto_bank = None
     else:
         raise Exception("Model not available")

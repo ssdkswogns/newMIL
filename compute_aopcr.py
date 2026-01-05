@@ -18,6 +18,8 @@ from mydataload import loadorean
 
 from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
 from models.milet import MILLET
+from models.MLSTM_FCN import MLSTM_FCN
+from models.os_cnn import OS_CNN
 
 warnings.filterwarnings("ignore")
 
@@ -137,19 +139,46 @@ def compute_classwise_aopcr(
                 raise ValueError("AmbiguousMIL output must be a tuple/list")
             logits, instance_logits, x_cls, x_seq, _c_seq, attn_layer1, attn_layer2 = out
             prob = torch.sigmoid(instance_logits.mean(dim=1))  # bag-level prob from instance logits
+            interpretation = None
+            non_weighted_instance_logit = None
         elif args.model == 'TimeMIL':
             out = milnet(x)
             logits, attn_layer1, attn_layer2 = out
             prob = torch.sigmoid(logits)
             instance_logits = None
+            interpretation = None
+            non_weighted_instance_logit = None
         elif args.model == 'newTimeMIL':
             out = milnet(x)
             logits, x_cls, attn_layer1, attn_layer2 = out
             prob = torch.sigmoid(logits)
             instance_logits = None
+            interpretation = None
+            non_weighted_instance_logit = None
         elif args.model == 'MILLET':
             logits, non_weighted_instance_logit, instance_logits = milnet(x)
             prob = torch.sigmoid(logits)
+            interpretation = None
+        elif args.model == 'MLSTM_FCN':
+            out = milnet(x, return_cam=True)
+            if isinstance(out, (tuple, list)) and len(out) == 2:
+                logits, interpretation = out  # interpretation: [B, C, T]
+            else:
+                raise ValueError("MLSTM_FCN expected to return (logits, cam)")
+            prob = torch.sigmoid(logits)
+            instance_logits = None
+            non_weighted_instance_logit = None
+            attn_layer1 = attn_layer2 = None
+        elif args.model == 'OS_CNN':
+            out = milnet(x, return_cam=True)
+            if isinstance(out, (tuple, list)) and len(out) == 2:
+                logits, interpretation = out  # [B, C, T]
+            else:
+                raise ValueError("OS_CNN expected to return (logits, cam)")
+            prob = torch.sigmoid(logits)
+            instance_logits = None
+            non_weighted_instance_logit = None
+            attn_layer1 = attn_layer2 = None
         else:
             raise ValueError(f"Unknown model name: {args.model}")
 
@@ -193,6 +222,10 @@ def compute_classwise_aopcr(
                     if non_weighted_instance_logit is not None: # [B, T, C]
                         scores = non_weighted_instance_logit[b, :, pred_c]
                         # scores = torch.softmax(non_weighted_instance_logit[b], dim=1)[:,pred_c]  # [T]
+                elif args.model in ['MLSTM_FCN', 'OS_CNN']:
+                    if interpretation is None:
+                        raise ValueError(f"{args.model} needs CAM interpretation for AOPCR")
+                    scores = interpretation[b, pred_c, :]
                 else:
                     raise ValueError(f"Unknown model name during score extraction: {args.model}")
 

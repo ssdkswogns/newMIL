@@ -19,6 +19,11 @@ python collect_aopcr.py \
 python collect_aopcr.py \
 --max-exp-id
 
+python ./move_latest_exps.py --max-exp-id --dest ./savemodel/ED-1NN_original_data /
+
+
 --bag_loss_w 0.5 --inst_loss_w 0.35 --proto_loss_w 0.15 \
 --attn_temp 0.3 --attn_softmax \
 --proto_topk_ratio 0.5 --proto_sim_thresh 0.65
+
+https://www.comp.hkbu.edu.hk/~csgzli/mtsc/

@@ -30,6 +30,7 @@ def parse_log(log_path: Path) -> Dict[str, Optional[Dict]]:
     aopcr_blocks: List[Dict] = []
     current_classes: List[Dict] = []
     best_block: Optional[Dict] = None
+    fallback_metrics: Optional[Dict] = None  # e.g., ED1NN lines without "Best Results"
     lines = log_path.read_text(errors="ignore").splitlines()
 
     for line in lines:
@@ -65,6 +66,18 @@ def parse_log(log_path: Path) -> Dict[str, Optional[Dict]]:
                 }
             )
             current_classes = []
+            continue
+
+        # Fallback metric line (e.g., ED1NN logs)
+        metric_pairs = METRIC_KV_RE.findall(line)
+        if metric_pairs and best_block is None:
+            keys_lower = [k.lower() for k, _ in metric_pairs]
+            # Only consider lines that look like global metrics
+            if any(k.startswith(("f1", "acc", "bal", "roc", "map")) for k in keys_lower):
+                fallback_metrics = {k: float(v) for k, v in metric_pairs}
+
+    if best_block is None:
+        best_block = fallback_metrics
 
     return {
         "best": best_block,
