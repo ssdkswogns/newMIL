@@ -70,9 +70,6 @@ dependencies:
       - smmap==5.0.2
       - threadpoolctl==3.5.0
       - timm==0.9.16
-      - torch==1.13.1+cu117
-      - torchaudio==0.13.1+cu117
-      - torchvision==0.14.1+cu117
       - tqdm==4.67.1
       - tslearn==0.6.4
       - typing-extensions==4.13.2
