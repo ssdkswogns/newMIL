@@ -35,52 +35,14 @@ import wandb
 from lookhead import Lookahead
 import warnings
 
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
-from models.hybridmil import HybridMIL, ContextualMIL
-from models.milet import MILLET
-from models.MLSTM_FCN import MLSTM_FCN
-from models.os_cnn import OS_CNN
-from models.ED_1NN import ED1NN
-from models.DTW_1NN_torch import dtw_1nn_D_predict_torch, dtw_1nn_I_predict_torch
+from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL
+from models.expmil import AmbiguousMILwithCL
 from compute_aopcr import compute_classwise_aopcr
 
 from os.path import join
 
 # Suppress all warnings
 warnings.filterwarnings("ignore")
-
-# ---------------------------------------------------------------------
-#   Reproducibility helpers
-# ---------------------------------------------------------------------
-def seed_everything(seed: int, deterministic: bool = True):
-    """
-    Seed python, numpy, torch (CPU/GPU) and toggle deterministic options.
-    """
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = deterministic
-    torch.backends.cudnn.benchmark = not deterministic
-    # disable TF32 to avoid tiny run-to-run drift on Ampere+
-    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-        torch.backends.cuda.matmul.allow_tf32 = False
-    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
-        torch.backends.cudnn.allow_tf32 = False
-    try:
-        torch.use_deterministic_algorithms(True)
-    except Exception:
-        # Some torch versions or ops may not support strict determinism; keep going.
-        pass
-
-
-def seed_worker(worker_id: int):
-    """Ensure numpy/python RNGs are also seeded inside dataloader workers."""
-    worker_seed = (torch.initial_seed() + worker_id) % 2 ** 32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
 
 # ----- DDP utils -----
 def setup_distributed():
@@ -106,6 +68,20 @@ def setup_distributed():
 def cleanup_distributed():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
+
+# ---------------------------------------------------------------------
+#   Seed
+# ---------------------------------------------------------------------
+seed = 42
+
+random.seed(seed)             # python random
+np.random.seed(seed)          # numpy random
+torch.manual_seed(seed)       # CPU
+torch.cuda.manual_seed(seed)  # GPU 단일
+torch.cuda.manual_seed_all(seed)  # multi-GPU
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # ---------------------------------------------------------------------
 #   PrototypeBank & Losses
@@ -344,7 +320,8 @@ def instance_prototype_contrastive_loss(
     S_valid = S_full.clone()
 
     # valid class: bag_label=1 AND prototype initialized
-    valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B,1,C]
+    valid_class_mask = initialized.view(1,1,C)
+    # valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B,1,C]
     S_valid = S_valid.masked_fill(~valid_class_mask, -1e9)
 
     # 3. direct non-ambiguous: per (b,t)에서 class 최대
@@ -428,8 +405,6 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
     sum_total = 0.0
     n = 0
 
-    hybrid_head = getattr(args, "hybrid_bag_head", "tp")
-
     for batch_id, (feats, label) in enumerate(trainloader):
         bag_feats = feats.to(device)
         bag_label = label.to(device)   # [B, C] multi-hot
@@ -443,39 +418,10 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         optimizer.zero_grad()
 
         # forward
-        if args.model == 'MILLET':
-            bag_prediction, instance_pred, interpretation = milnet(bag_feats)
-            x_cls, x_seq = None, None
-        elif args.model == 'OS_CNN':
-            out = milnet(bag_feats, return_cam=True)
-            bag_prediction, interpretation = out
-            instance_pred = None
-            x_cls, x_seq = None, None
-        elif args.model == 'MLSTM_FCN':
-            bag_prediction = milnet(bag_feats)
-            instance_pred = None
-            x_cls, x_seq = None, None
-        elif args.model == 'AmbiguousMIL':
-            if epoch < args.epoch_des:
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(
-                    bag_feats, warmup=True
-                )
-            else:
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = milnet(
-                    bag_feats, warmup=False
-                )
-        elif args.model == 'HybridMIL' or args.model == 'ContextualMIL':
-            # HybridMIL/ContextualMIL returns: (bag_logits_ts, bag_logits_tp, weighted_logits, inst_logits,
-            #                     bag_emb, inst_emb, attn_ts, attn_tp)
-            outputs = milnet(bag_feats, warmup=(epoch < args.epoch_des))
-            bag_logits_ts, bag_logits_tp, weighted_logits, inst_logits, x_cls, x_seq, attn_ts, attn_tp = outputs
-            # Select bag head (tp = conjunctive pooling, ts = attention pooling)
-            bag_prediction = bag_logits_tp if hybrid_head != "ts" else bag_logits_ts
-            instance_pred = inst_logits
-            # c_seq not available in HybridMIL/ContextualMIL
-            c_seq = None
-            attn_layer1 = attn_ts
-            attn_layer2 = attn_tp
+        if args.model == 'AmbiguousMIL':
+            bag_prediction, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = milnet(
+                bag_feats
+            )
         else:
             if epoch < args.epoch_des:
                 bag_prediction = milnet(bag_feats, warmup=True)
@@ -505,21 +451,23 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             # inst_loss = F.binary_cross_entropy(
             #     p_bag_from_inst, bag_label.float()
             # )
-            p_inst = instance_pred.mean(dim=1)       # [B, C]
-            inst_loss = criterion(p_inst, bag_label)
+            # p_inst = instance_pred.mean(dim=1)       # [B, C]
+            inst_loss = criterion(instance_pred, bag_label)
 
             # ortho_loss = class_token_orthogonality_loss(x_cls)
 
             # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
 
-            # sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
+            instance_pred_s = torch.sigmoid(weighted_instance_pred)
+            p_inst_s = instance_pred_s.mean(dim=1)
+            sparsity_per_class = p_inst_s.mean(dim=(0, 1))    # [C]
             # if pos_mask.sum() > 0:
             #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
             #         pos_mask.sum() + 1e-6
             #     )
             # else:
-            #     sparsity_loss = torch.tensor(0.0, device=device)
-            # sparsity_loss = sparsity_per_class.mean()
+                # sparsity_loss = torch.tensor(0.0, device=device)
+            sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
 
             # diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
             # diff = diff * pos_mask[None, None, :]
@@ -540,13 +488,13 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                 )
 
         # 최종 loss
-        if args.model == 'AmbiguousMIL' or args.model == 'HybridMIL' or args.model == 'ContextualMIL':
+        if args.model == 'AmbiguousMIL':
             loss = (
                 args.bag_loss_w * bag_loss
                 + args.inst_loss_w * inst_loss
                 # + args.ortho_loss_w * ortho_loss
                 # + args.smooth_loss_w * smooth_loss
-                # + args.sparsity_loss_w * sparsity_loss
+                + args.sparsity_loss_w * sparsity_loss
                 + args.proto_loss_w * proto_inst_loss
                 # + args.cls_contrast_w * cls_contrast_loss
             )
@@ -569,7 +517,7 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         sum_inst += float(inst_loss) if isinstance(inst_loss, float) else float(inst_loss)
         # sum_ortho += ortho_loss.item()
         # sum_smooth += smooth_loss.item()
-        # sum_sparsity += sparsity_loss.item()
+        sum_sparsity += sparsity_loss.item()
         sum_proto_inst += proto_inst_loss.item()
         # sum_cls_contrast += cls_contrast_loss.item()
         sum_total += loss.item()
@@ -582,7 +530,7 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             "train/inst_loss": sum_inst / max(1, n),
             # "train/ortho_loss": sum_ortho / max(1, n),
             # "train/smooth_loss": sum_smooth / max(1, n),
-            # "train/sparsity_loss": sum_sparsity / max(1, n),
+            "train/sparsity_loss": sum_sparsity / max(1, n),
             # "train/ctx_contrast_loss": sum_ctx_contrast / max(1, n),
             "train/proto_inst_loss": sum_proto_inst / max(1, n),
             # "train/cls_contrast_loss": sum_cls_contrast / max(1, n),
@@ -613,8 +561,6 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
     sum_total = 0.0
     n = 0
 
-    hybrid_head = getattr(args, "hybrid_bag_head", "tp")
-
     inst_total_correct = 0
     inst_total_count   = 0
 
@@ -631,29 +577,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             bag_label = label.to(device)   # [B, C]
 
             if args.model == 'AmbiguousMIL':
-                bag_prediction, instance_pred, x_cls, x_seq, c_seq, attn_layer1, attn_layer2 = model(bag_feats)
-            elif args.model == 'HybridMIL' or args.model == 'ContextualMIL':
-                outputs = model(bag_feats)
-                bag_logits_ts, bag_logits_tp, weighted_logits, inst_logits, x_cls, x_seq, attn_ts, attn_tp = outputs
-                bag_prediction = bag_logits_tp if hybrid_head != "ts" else bag_logits_ts
-                instance_pred = inst_logits
-                c_seq = None
-                attn_layer1 = attn_ts
-                attn_layer2 = attn_tp
-            elif args.model == 'MILLET':
-                bag_prediction, instance_pred, interpretation = model(bag_feats)
-                attn_layer2 = None
-                x_seq = None
-            elif args.model == 'OS_CNN':
-                out = model(bag_feats, return_cam=True)
-                bag_prediction, interpretation = out
-                instance_pred = None
-                attn_layer2 = None
-            elif args.model == 'MLSTM_FCN':
-                out = model(bag_feats)
-                bag_prediction = out if not isinstance(out, (tuple, list)) else out[0]
-                instance_pred = None
-                attn_layer2 = None
+                bag_prediction, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = milnet(bag_feats)
             elif args.model == 'newTimeMIL':
                 out = model(bag_feats)
                 instance_pred = None
@@ -696,24 +620,26 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 #     p_bag_from_inst, bag_label.float()
                 # )
 
-                p_inst = instance_pred.mean(dim=1)       # [B, C]
-                inst_loss = criterion(p_inst, bag_label)
+                # p_inst = instance_pred.mean(dim=1)       # [B, C]
+                inst_loss = criterion(instance_pred, bag_label)
 
                 # # class token orthogonality
                 # ortho_loss = class_token_orthogonality_loss(x_cls)
 
-                # # 이번 배치에서 실제로 등장한 positive class만 선택
-                # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
+                # 이번 배치에서 실제로 등장한 positive class만 선택
+                pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
 
-                # # sparsity loss
-                # sparsity_per_class = p_inst.mean(dim=(0, 1))    # [C]
+                # sparsity loss
+                instance_pred_s = torch.sigmoid(weighted_instance_pred)
+                p_inst_s = instance_pred_s.mean(dim=1)
+                sparsity_per_class = p_inst_s.mean(dim=(0, 1))    # [C]
                 # if pos_mask.sum() > 0:
                 #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
                 #         pos_mask.sum() + 1e-6
                 #     )
                 # else:
-                #     sparsity_loss = torch.tensor(0.0, device=device)
-                # sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
+                    # sparsity_loss = torch.tensor(0.0, device=device)
+                sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
 
                 # # temporal smoothness loss
                 # diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
@@ -733,15 +659,14 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
 
                 if args.datatype == "mixed" and (y_inst is not None):
                     # y_inst: [B, T, C] one-hot instance labels
+                    # CPU에 있어도 되지만, 일단 계산 편의를 위해 device로 올림
                     y_inst = y_inst.to(device)
+                    # timestep별 정답 클래스 인덱스
                     y_inst_label = torch.argmax(y_inst, dim=2)  # [B, T]
 
+                    # AmbiguousMIL인 경우 instance_pred에서 직접 argmax
                     if args.model == 'AmbiguousMIL':
-                        pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
-                    elif args.model == 'HybridMIL' or args.model == 'ContextualMIL':
-                        pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
-                    elif args.model == 'MILLET':
-                        pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
+                        pred_inst = torch.argmax(weighted_instance_pred, dim=2)  # [B, T]
                     elif args.model == 'newTimeMIL' and attn_layer2 is not None:
                         B, T, C = y_inst.shape
                         attn_cls = attn_layer2[:,:,:C,C:]
@@ -756,13 +681,13 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                         inst_total_correct += correct
                         inst_total_count   += count
 
-            if args.model == 'AmbiguousMIL' or args.model == 'HybridMIL' or args.model == 'ContextualMIL':
+            if args.model == 'AmbiguousMIL':
                 loss = (
                     args.bag_loss_w * bag_loss
                     + args.inst_loss_w * inst_loss
                     # + args.ortho_loss_w * ortho_loss
                     # + args.smooth_loss_w * smooth_loss
-                    # + args.sparsity_loss_w * sparsity_loss
+                    + args.sparsity_loss_w * sparsity_loss
                     + args.proto_loss_w * proto_inst_loss
                     # + args.cls_contrast_w * cls_contrast_loss
                 )
@@ -776,11 +701,9 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 )
 
             total_loss += loss.item()
-
+            
             if args.model == 'AmbiguousMIL':
-                probs = torch.sigmoid(p_inst).cpu().numpy() # p_inst is main output for evaluation
-            elif args.model == 'HybridMIL' or args.model == 'ContextualMIL':
-                probs = torch.sigmoid(bag_prediction).cpu().numpy()
+                probs = torch.sigmoid(instance_pred).cpu().numpy() # p_inst is main output for evaluation
             else:
                 probs = torch.sigmoid(bag_prediction).cpu().numpy()
             all_probs.append(probs)
@@ -790,7 +713,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             sum_inst += float(inst_loss) if isinstance(inst_loss, float) else float(inst_loss)
             # sum_ortho += ortho_loss.item()
             # sum_smooth += smooth_loss.item()
-            # sum_sparsity += sparsity_loss.item()
+            sum_sparsity += sparsity_loss.item()
             sum_proto_inst += proto_inst_loss.item()
             # sum_cls_contrast += cls_contrast_loss.item()
             sum_total += loss.item()
@@ -837,7 +760,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             "val/inst_loss": sum_inst / max(1, n),
             # "val/ortho_loss": sum_ortho / max(1, n),
             # "val/smooth_loss": sum_smooth / max(1, n),
-            # "val/sparsity_loss": sum_sparsity / max(1, n),
+            "val/sparsity_loss": sum_sparsity / max(1, n),
             # "val/ctx_contrast_loss": sum_ctx_contrast / max(1, n),
             "val/proto_inst_loss": sum_proto_inst / max(1, n),
             # "val/cls_contrast_loss": sum_cls_contrast / max(1, n),
@@ -878,22 +801,9 @@ def main():
     parser.add_argument('--dropout_patch', default=0.5, type=float, help='Patch dropout rate [0] 0.5')
     parser.add_argument('--dropout_node', default=0.2, type=float, help='Bag classifier dropout rate [0]')
     parser.add_argument('--seed', default=0, type=int, help='random seed')
-    parser.add_argument('--model', default='TimeMIL', type=str,
-                        help='Model (TimeMIL | newTimeMIL | AmbiguousMIL | HybridMIL | ContextualMIL | MILLET | MLSTM_FCN | OS_CNN | ED1NN | DTW1NN_D | DTW1NN_I)')
+    parser.add_argument('--model', default='TimeMIL', type=str, help='MIL model')
     parser.add_argument('--prepared_npz', type=str, default='./data/PAMAP2.npz', help='전처리 결과 npz 경로 (예: ./data/PAMAP2.npz)')
     parser.add_argument('--optimizer', default='adamw', type=str, help='adamw sgd')
-    parser.add_argument('--millet_pooling', default='conjunctive', type=str,
-                        help="Pooling for MILLET (conjunctive | attention | instance | additive | gap)")
-    parser.add_argument('--ed1nn_normalize', action='store_true', help='Z-score features before running ED1NN baseline')
-    parser.add_argument('--dtw_window', type=int, default=None, help='Sakoe-Chiba window for DTW baselines (None = full)')
-    parser.add_argument('--dtw_max_train', type=int, default=None, help='Limit DTW baselines to first N train samples')
-    parser.add_argument('--dtw_max_test', type=int, default=None, help='Limit DTW baselines to first N test samples')
-
-    # ContextualMIL arguments
-    parser.add_argument('--attn_layers', type=int, default=1, help='Number of self-attention layers for ContextualMIL')
-    parser.add_argument('--attn_heads', type=int, default=4, help='Number of attention heads for ContextualMIL')
-    parser.add_argument('--attn_dropout', type=float, default=0.1, help='Attention dropout for ContextualMIL')
-    parser.add_argument('--use_pos_enc', type=int, default=1, help='Use positional encoding for ContextualMIL (0/1)')
 
     parser.add_argument('--save_dir', default='./savemodel/', type=str, help='the directory used to save all the output')
     parser.add_argument('--epoch_des', default=20, type=int, help='turn on warmup')
@@ -911,15 +821,12 @@ def main():
                         help='similarity threshold to treat instance as confident')
     parser.add_argument('--proto_win', type=int, default=5,
                         help='temporal neighbor window for ambiguous instances')
-    parser.add_argument('--hybrid_bag_head', type=str, default='tp',
-                        choices=['tp', 'ts'],
-                        help='Which Hybrid/ContextualMIL bag head to use (tp=conjunctive, ts=attention)')
     # loss weights
     parser.add_argument('--bag_loss_w', type=float, default=0.5, help='weight for bag-level loss')
     parser.add_argument('--inst_loss_w', type=float, default=0.2, help='weight for instance-level MIL loss')
     parser.add_argument('--ortho_loss_w', type=float, default=0.0, help='weight for class token orthogonality loss')
-    parser.add_argument('--smooth_loss_w', type=float, default=0.00, help='weight for temporal smoothness loss')
-    parser.add_argument('--sparsity_loss_w', type=float, default=0.00, help='weight for sparsity loss')
+    parser.add_argument('--smooth_loss_w', type=float, default=0.05, help='weight for temporal smoothness loss')
+    parser.add_argument('--sparsity_loss_w', type=float, default=0.05, help='weight for sparsity loss')
     parser.add_argument('--ctx_contrast_w', type=float, default=0.0, help='weight for context contrastive loss')
     parser.add_argument('--proto_loss_w', type=float, default=0.2, help='weight for prototype instance contrastive loss')
     parser.add_argument('--cls_contrast_tau', type=float, default=0.1, help='temperature for batch class embedding contrastive loss')
@@ -932,7 +839,10 @@ def main():
 
     # rank별 seed 다르게
     base_seed = args.seed
-    seed_everything(base_seed + rank)
+    random.seed(base_seed + rank)
+    np.random.seed(base_seed + rank)
+    torch.manual_seed(base_seed + rank)
+    torch.cuda.manual_seed_all(base_seed + rank)
 
     # ----- 디렉토리 / wandb / logger -----
     args.save_dir = args.save_dir + 'InceptBackbone'
@@ -958,7 +868,7 @@ def main():
     version_name = os.path.basename(exp_path)
 
     if is_main:
-        print(f'Running {args.model} on dataset: {args.dataset}')
+        print(f'Running TimeMIL on dataset: {args.dataset}')
         wandb.init(project="TimeMIL", name=f"{args.dataset}_{args.model}_{version_name}", config=vars(args))
         wandb.define_metric("epoch")
         wandb.define_metric("train/*", step_metric="epoch")
@@ -1009,35 +919,15 @@ def main():
         if is_main:
             print(f'num class:{args.num_classes}')
     else:
-        res_tr = load_classification(name=args.dataset, split='train', extract_path='./data')
-        res_te = load_classification(name=args.dataset, split='test',  extract_path='./data')
-
-        # aeon 버전에 따라 meta가 없는 경우가 있어 대응
-        if len(res_tr) == 3:
-            Xtr_np, ytr, meta = res_tr
-        else:
-            Xtr_np, ytr = res_tr
-            meta = {'class_values': np.unique(ytr)}
-
-        if len(res_te) == 3:
-            Xte_np, yte, _meta_unused = res_te
-        else:
-            Xte_np, yte = res_te
-
-        # Optional DTW train/test subsampling for speed
-        if args.dtw_max_train is not None:
-            Xtr_np = Xtr_np[:args.dtw_max_train]
-            ytr = ytr[:args.dtw_max_train]
-        if args.dtw_max_test is not None:
-            Xte_np = Xte_np[:args.dtw_max_test]
-            yte = yte[:args.dtw_max_test]
+        Xtr, ytr, meta = load_classification(name=args.dataset, split='train',extract_path='./data')
+        Xte, yte, _   = load_classification(name=args.dataset, split='test',extract_path='./data')
 
         word_to_idx = {cls:i for i, cls in enumerate(meta['class_values'])}
         ytr_idx = torch.tensor([word_to_idx[i] for i in ytr], dtype=torch.long)
         yte_idx = torch.tensor([word_to_idx[i] for i in yte], dtype=torch.long)
 
-        Xtr = torch.from_numpy(Xtr_np).permute(0,2,1).float()
-        Xte = torch.from_numpy(Xte_np).permute(0,2,1).float()
+        Xtr = torch.from_numpy(Xtr).permute(0,2,1).float()
+        Xte = torch.from_numpy(Xte).permute(0,2,1).float()
 
         num_classes = len(meta['class_values'])
         args.num_classes = num_classes
@@ -1071,55 +961,6 @@ def main():
             print(f'num class: {args.num_classes}')
             print(f'total_len: {SYN_TOTAL_LEN}')
 
-    # --------- 1NN baselines (original data only) ---------
-    if args.model in ['ED1NN', 'DTW1NN_D', 'DTW1NN_I']:
-        if args.datatype != 'original':
-            raise ValueError(f"{args.model} baseline supports only datatype=original (single-label).")
-        # These baselines currently rely on aeon datasets (Xtr_np/Xte_np defined above)
-        if 'Xtr_np' not in locals():
-            raise ValueError(f"{args.model} baseline is only supported for aeon datasets loaded via load_classification.")
-
-        if is_main:
-            y_train_np = ytr_idx.numpy()
-            y_test_np = yte_idx.numpy()
-
-        if args.model == 'ED1NN':
-            clf = ED1NN(normalize=args.ed1nn_normalize)
-            clf.fit(Xtr_np, y_train_np)
-            y_pred = clf.predict(Xte_np)
-        elif args.model == 'DTW1NN_I':
-            y_pred = dtw_1nn_I_predict_torch(
-                Xtr_np, y_train_np, Xte_np, device=device, window=args.dtw_window
-            )
-        else:  # DTW1NN_D
-            y_pred = dtw_1nn_D_predict_torch(
-                Xtr_np, y_train_np, Xte_np, device=device, window=args.dtw_window
-            )
-
-            acc = accuracy_score(y_test_np, y_pred)
-            bal_acc = balanced_accuracy_score(y_test_np, y_pred)
-            f1_ma = f1_score(y_test_np, y_pred, average='macro')
-
-            print(f"[{args.model}] Dataset: {args.dataset}")
-            print(f"Train: {Xtr_np.shape} | Test: {Xte_np.shape}")
-            print(f"Accuracy:          {acc:.4f}")
-            print(f"Balanced Accuracy: {bal_acc:.4f}")
-            print(f"F1 (macro):        {f1_ma:.4f}")
-
-            if wandb.run is not None:
-                wandb.log({
-                    "score/acc": acc,
-                    "score/bal_acc": bal_acc,
-                    "score/f1_macro": f1_ma,
-                })
-            if logger is not None:
-                logger.info(
-                    ('[%s] Acc=%.4f BalAcc=%.4f F1(Ma)=%.4f') %
-                    (args.model, acc, bal_acc, f1_ma)
-                )
-        cleanup_distributed()
-        return
-
     # ---------------- 모델 구성 ----------------
     if args.model =='TimeMIL':
         base_model = TimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len).to(device)
@@ -1128,58 +969,7 @@ def main():
         base_model = newTimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len).to(device)
         proto_bank = None
     elif args.model == 'AmbiguousMIL':
-        base_model = AmbiguousMILwithCL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len, is_instance=True).to(device)
-        proto_bank = PrototypeBank(
-            num_classes=num_classes,
-            dim=args.embed,
-            device=device,
-            momentum=0.9,
-        )
-    elif args.model == 'MILLET':
-        base_model = MILLET(args.feats_size, mDim=args.embed, n_classes=num_classes,
-                            dropout=args.dropout_node, max_seq_len=seq_len,
-                            pooling=args.millet_pooling, is_instance=True).to(device)
-        proto_bank = None
-    elif args.model == 'OS_CNN':
-        base_model = OS_CNN(
-            in_channels=args.feats_size,
-            n_class=num_classes,
-            layer_parameter_list=None,
-            few_shot=False
-        ).to(device)
-        proto_bank = None
-    elif args.model == 'MLSTM_FCN':
-        base_model = MLSTM_FCN(
-            input_dim=args.feats_size,
-            num_classes=num_classes,
-        ).to(device)
-        proto_bank = None
-    elif args.model == 'HybridMIL':
-        base_model = HybridMIL(
-            in_features=args.feats_size,
-            n_classes=num_classes,
-            mDim=args.embed,
-            dropout=args.dropout_node,
-            is_instance=True
-        ).to(device)
-        proto_bank = PrototypeBank(
-            num_classes=num_classes,
-            dim=args.embed,
-            device=device,
-            momentum=0.9,
-        )
-    elif args.model == 'ContextualMIL':
-        base_model = ContextualMIL(
-            in_features=args.feats_size,
-            n_classes=num_classes,
-            mDim=args.embed,
-            dropout=args.dropout_node,
-            is_instance=True,
-            attn_layers=getattr(args, 'attn_layers', 1),
-            attn_heads=getattr(args, 'attn_heads', 4),
-            attn_dropout=getattr(args, 'attn_dropout', 0.1),
-            use_pos_enc=bool(getattr(args, 'use_pos_enc', True)),
-        ).to(device)
+        base_model = AmbiguousMILwithCL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, is_instance=True).to(device)
         proto_bank = PrototypeBank(
             num_classes=num_classes,
             dim=args.embed,
@@ -1238,18 +1028,15 @@ def main():
         test_sampler  = None
         shuffle_train = True
 
-    loader_generator = torch.Generator()
-    loader_generator.manual_seed(base_seed + rank)
-
     trainloader = DataLoader(
         trainset, batch_size=batch, shuffle=shuffle_train,
         num_workers=args.num_workers, drop_last=False, pin_memory=True,
-        sampler=train_sampler, worker_init_fn=seed_worker, generator=loader_generator
+        sampler=train_sampler
     )
     testloader = DataLoader(
         testset, batch_size=1, shuffle=False,
         num_workers=args.num_workers, drop_last=False, pin_memory=True,
-        sampler=test_sampler, worker_init_fn=seed_worker, generator=loader_generator
+        sampler=test_sampler
     )
 
     def _four_sig(val: float):
@@ -1448,31 +1235,7 @@ def main():
                                     dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
         elif args.model == 'AmbiguousMIL':
             eval_model = AmbiguousMILwithCL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
-                                            dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
-        elif args.model == 'MILLET':
-            eval_model = MILLET(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
-                                dropout=args.dropout_node, max_seq_len=args.seq_len,
-                                pooling=args.millet_pooling, is_instance=True).to(device)
-        elif args.model == 'HybridMIL':
-            eval_model = HybridMIL(
-                in_features=args.feats_size,
-                n_classes=args.num_classes,
-                mDim=args.embed,
-                dropout=args.dropout_node,
-                is_instance=True
-            ).to(device)
-        elif args.model == 'ContextualMIL':
-            eval_model = ContextualMIL(
-                in_features=args.feats_size,
-                n_classes=args.num_classes,
-                mDim=args.embed,
-                dropout=args.dropout_node,
-                is_instance=True,
-                attn_layers=getattr(args, 'attn_layers', 1),
-                attn_heads=getattr(args, 'attn_heads', 4),
-                attn_dropout=getattr(args, 'attn_dropout', 0.1),
-                use_pos_enc=bool(getattr(args, 'use_pos_enc', True)),
-            ).to(device)
+                                            dropout=args.dropout_node, is_instance=True).to(device)
         else:
             eval_model = None
 
@@ -1509,17 +1272,12 @@ def main():
                     )
 
             # AOPCR with batch_size=1 for perturbation routine
-            aopcr_loader_gen = torch.Generator()
-            aopcr_loader_gen.manual_seed(base_seed + rank + 999)
-            aopcr_rng = torch.Generator(device=device)
-            aopcr_rng.manual_seed(base_seed + rank + 999)
             testloader_aopcr = DataLoader(
                 testset, batch_size=1, shuffle=False,
-                num_workers=args.num_workers, drop_last=False, pin_memory=True,
-                worker_init_fn=seed_worker, generator=aopcr_loader_gen
+                num_workers=args.num_workers, drop_last=False, pin_memory=True
             )
             print("Computing class-wise AOPCR with best model ...")
-            aopcr_c, aopcr_w_avg, aopcr_mean, aopcr_sum, M_expl, M_rand, alphas, counts, _coverage = compute_classwise_aopcr(
+            aopcr_c, aopcr_w_avg, aopcr_mean, aopcr_sum, M_expl, M_rand, alphas, counts = compute_classwise_aopcr(
                 eval_model,
                 testloader_aopcr,
                 args,
@@ -1527,7 +1285,6 @@ def main():
                 step=0.05,
                 n_random=3,
                 pred_threshold=0.5,
-                rng=aopcr_rng,
             )
             for c in range(args.num_classes):
                 name = str(c)

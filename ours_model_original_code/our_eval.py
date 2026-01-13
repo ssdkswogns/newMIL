@@ -27,11 +27,9 @@ from aeon.datasets import load_classification
 from syntheticdataset import MixedSyntheticBagsConcatK
 from utils import *
 from mydataload import loadorean
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMILwithCL
+from models.timemil import TimeMIL, newTimeMIL
+from models.expmil import AmbiguousMILwithCL
 from compute_aopcr import compute_classwise_aopcr
-from models.milet import MILLET
-from models.hybridmil import HybridMIL, ContextualMIL
-from models.hybridmil import HybridMIL, ContextualMIL
 
 warnings.filterwarnings("ignore")
 
@@ -66,52 +64,32 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
             if args.model == 'AmbiguousMIL':
                 if not isinstance(out, (tuple, list)) or len(out) < 6:
                     raise ValueError("Unexpected AmbiguousMIL output")
-                logits, instance_pred = out[0], out[1]
-                attn_layer2 = out[-1]
-            elif args.model in ['HybridMIL', 'ContextualMIL']:
-                if not isinstance(out, (tuple, list)) or len(out) < 4:
-                    raise ValueError("Unexpected Hybrid/ContextualMIL output")
-                bag_logits_ts, bag_logits_tp, weighted_logits, inst_logits = out[:4]
-                logits = bag_logits_tp if getattr(args, "hybrid_bag_head", "tp") != "ts" else bag_logits_ts
-                instance_pred = inst_logits
+                logits, instance_pred, pred_inst = out[0], out[1], out[2]
                 attn_layer2 = None
-            elif args.model in ['TimeMIL', 'newTimeMIL']:
+            else:
                 if not isinstance(out, (tuple, list)) or len(out) < 4:
                     raise ValueError("Unexpected model output")
                 logits, _, _, attn_layer2 = out
+                attn_cls = attn_layer2[:, :, :C, C:]
+                attn_mean = attn_cls.mean(dim=1)
                 instance_pred = None
-            elif args.model == 'MILLET':
-                if not isinstance(out, (tuple, list)) or len(out) < 3:
-                    raise ValueError("Unexpected MILLET output")
-                # MILLET returns (bag_logits, instance_logits[B,T,C], interpretation[B,C,T])
-                logits, non_weighted_instance_pred, instance_pred = out
-                attn_layer2 = None
-            else:
-                raise ValueError(f"Unknown model {args.model}")
 
             loss = criterion(logits, bag_label)
             total_loss += loss.item()
 
-            probs = torch.sigmoid(logits).cpu().numpy()  # [B, C]
+            if args.model == 'AmbiguousMIL':
+                probs = torch.sigmoid(instance_pred).cpu().numpy()
+            else:
+                probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.append(probs)
             all_labels.append(label.cpu().numpy())
 
             _, _, C = y_inst.shape
-            if args.model in ['HybridMIL', 'ContextualMIL'] and instance_pred is not None:
-                pred_inst = torch.argmax(instance_pred, dim=2).cpu()
-            elif args.model == 'MILLET' and instance_pred is not None:
-                # MILLET interpretation map is [B, C, T]; follow main_cl_fix behavior
-                pred_inst = torch.argmax(non_weighted_instance_pred, dim=2).cpu()
-            else:
-                if attn_layer2 is None:
-                    raise ValueError("Attention output is required for instance prediction")
-                attn_cls = attn_layer2[:, :, :C, C:]
-                attn_mean = attn_cls.mean(dim=1)
 
-                if args.model == 'AmbiguousMIL' and instance_pred is not None:
-                    pred_inst = torch.argmax(instance_pred, dim=2).cpu()
-                else:
-                    pred_inst = torch.argmax(attn_mean, dim=1).cpu()
+            if args.model == 'AmbiguousMIL' and instance_pred is not None:
+                pred_inst = torch.argmax(pred_inst, dim=2).cpu()
+            else:
+                pred_inst = torch.argmax(attn_mean, dim=1).cpu()
 
             y_inst_label = torch.argmax(y_inst, dim=2).cpu()
 
@@ -186,26 +164,6 @@ def build_datasets(args):
     Mirrors the logic from compute_aopcr and instance_val_cl to build train/test sets.
     Returns (testset, class_names, seq_len, num_classes, feat_dim)
     """
-    def _load_split_with_meta(name: str, split: str, extract_path: str):
-        """aeon load_classification wrapper that always returns (X, y, meta)."""
-        res = load_classification(
-            name=name,
-            split=split,
-            extract_path=extract_path,
-            return_metadata=True,
-        )
-        if isinstance(res, tuple):
-            if len(res) == 3:
-                return res
-            if len(res) == 2:
-                X, y = res
-                meta = {"class_values": list(dict.fromkeys(y))}
-                return X, y, meta
-        raise ValueError(
-            f"Unexpected return from load_classification for {name} ({split}): "
-            f"{type(res)} len={len(res) if hasattr(res,'__len__') else 'na'}"
-        )
-
     if args.dataset in ['JapaneseVowels', 'SpokenArabicDigits', 'CharacterTrajectories', 'InsectWingbeat']:
         trainset = loadorean(args, split='train')
         testset = loadorean(args, split='test')
@@ -220,8 +178,8 @@ def build_datasets(args):
             class_names = [str(i) for i in range(num_classes)]
         return testset, class_names, seq_len, num_classes, L_in
 
-    Xtr, ytr, meta = _load_split_with_meta(name=args.dataset, split='train', extract_path='./data')
-    Xte, yte, _ = _load_split_with_meta(name=args.dataset, split='test', extract_path='./data')
+    Xtr, ytr, meta = load_classification(name=args.dataset, split='train', extract_path='./data')
+    Xte, yte, _ = load_classification(name=args.dataset, split='test', extract_path='./data')
 
     Xtr = torch.from_numpy(Xtr).permute(0, 2, 1).float()  # [N,T,D]
     Xte = torch.from_numpy(Xte).permute(0, 2, 1).float()
@@ -268,35 +226,7 @@ def build_model(args, seq_len, num_classes, device):
     elif args.model == 'AmbiguousMIL':
         milnet = AmbiguousMILwithCL(args.feats_size, mDim=args.embed,
                                     n_classes=num_classes,
-                                    dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-                         max_seq_len=seq_len, is_instance=True).to(device)
-    elif args.model == 'HybridMIL':
-        milnet = HybridMIL(
-            in_features=args.feats_size,
-            n_classes=num_classes,
-            mDim=args.embed,
-            dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-            is_instance=True
-        ).to(device)
-    elif args.model == 'ContextualMIL':
-        milnet = ContextualMIL(
-            in_features=args.feats_size,
-            n_classes=num_classes,
-            mDim=args.embed,
-            dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-            is_instance=True,
-            attn_layers=getattr(args, 'attn_layers', 1),
-            attn_heads=getattr(args, 'attn_heads', 4),
-            attn_dropout=getattr(args, 'attn_dropout', 0.1),
-            use_pos_enc=bool(getattr(args, 'use_pos_enc', True)),
-        ).to(device)
-    elif args.model == 'MILLET':
-        milnet = MILLET(args.feats_size, mDim=args.embed,
-                        n_classes=num_classes,
-                        dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-                        max_seq_len=seq_len,
-                        pooling=getattr(args, "millet_pooling", "conjunctive"),
-                        is_instance=True).to(device)
+                                    dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0, is_instance=True).to(device)
     else:
         raise Exception("Model not available")
     return milnet
@@ -310,28 +240,13 @@ def main():
     parser.add_argument('--feats_size', default=512, type=int, help='Dimension of the feature size')
     parser.add_argument('--gpu_index', type=int, nargs='+', default=(0,), help='GPU ID(s) [0]')
     parser.add_argument('--seed', default=0, type=int, help='random seed')
-    parser.add_argument('--model', default='newTimeMIL', type=str,
-                        help='MIL model: TimeMIL | newTimeMIL | AmbiguousMIL | HybridMIL | ContextualMIL | MILLET')
+    parser.add_argument('--model', default='newTimeMIL', type=str, help='MIL model: TimeMIL | newTimeMIL | AmbiguousMIL')
     parser.add_argument('--model_path', default='./savemodel/InceptBackbone/BasicMotions/exp_7/weights/best_newTimeMIL.pth',
                         type=str, help='Target model path for evaluation')
     parser.add_argument('--embed', default=128, type=int, help='Number of embedding')
     parser.add_argument('--batchsize', default=64, type=int, help='batchsize')
     parser.add_argument('--num_random', default=3, type=int, help='Random baseline repetition for AOPCR')
-    parser.add_argument('--aopcr_stop', default=0.5, type=float,
-                        help='AOPCR perturbation limit (0.0-1.0). Default 0.5 (50%%). Use 1.0 for full range.')
-    parser.add_argument('--aopcr_step', default=0.05, type=float,
-                        help='AOPCR perturbation step size. Default 0.05 (5%%).')
-    parser.add_argument('--aopcr_save_npz', default=None, type=str,
-                        help='Optional path to save AOPCR curves (npz with M_expl, M_rand, alphas, counts)')
-    parser.add_argument('--plot_aopcr', action='store_true',
-                        help='If set, save a weighted mean AOPCR curve plot (matplotlib).')
-    parser.add_argument('--aopcr_plot_path', default='aopcr_curve.png', type=str,
-                        help='Output path for AOPCR curve plot when --plot_aopcr is used.')
     parser.add_argument('--dropout_node', default=0.0, type=float, help='Dropout rate for classifier heads')
-    parser.add_argument('--millet_pooling', default="conjunctive", type=str,
-                        help="MILLET pooling method: conjunctive | attention | instance | additive | gap")
-    parser.add_argument('--hybrid_bag_head', default='tp', choices=['tp', 'ts'],
-                        help='Hybrid/ContextualMIL bag head to use (tp=conjunctive, ts=attention)')
     parser.add_argument('--no_fallback_to_predicted', action='store_false', dest='fallback_to_predicted',
                         help='If set, skip bags with no positive labels instead of using argmax prediction')
     parser.add_argument('--cls_threshold', default=0.5, type=float, help='Threshold for multi-label classification metrics')
@@ -355,7 +270,7 @@ def main():
 
     # DataLoader
     testloader = DataLoader(
-        testset, batch_size=args.batchsize, shuffle=False,
+        testset, batch_size=1, shuffle=False,
         num_workers=args.num_workers, drop_last=False, pin_memory=True
     )
 
@@ -374,61 +289,16 @@ def main():
     print("Instance accuracy:", inst_acc)
 
     # AOPCR
-    print(f"Computing class-wise AOPCR (stop={args.aopcr_stop}, step={args.aopcr_step}) ...")
-    result = compute_classwise_aopcr(
+    print("Computing class-wise AOPCR ...")
+    aopcr_c, aopcr_w_avg, aopcr_mean, aopcr_sum, M_expl, M_rand, alphas, counts = compute_classwise_aopcr(
         milnet,
         testloader,
         args,
-        stop=args.aopcr_stop,
-        step=args.aopcr_step,
+        stop=0.5,
+        step=0.05,
         n_random=args.num_random,
-        pred_threshold=0.5,
-        coverage_thresholds=[0.9, 0.8, 0.7, 0.5]
+        pred_threshold=0.5
     )
-    aopcr_c, aopcr_w_avg, aopcr_mean, aopcr_overall, M_expl, M_rand, alphas, counts, coverage_summary = result
-
-    if args.aopcr_save_npz:
-        np.savez(
-            args.aopcr_save_npz,
-            M_expl=M_expl,
-            M_rand=M_rand,
-            alphas=alphas,
-            counts=counts,
-            aopcr_c=aopcr_c,
-            aopcr_w_avg=aopcr_w_avg,
-            aopcr_mean=aopcr_mean,
-            coverage_summary=coverage_summary,
-            allow_pickle=True,
-        )
-        print(f"Saved AOPCR arrays to {args.aopcr_save_npz}")
-
-    if args.plot_aopcr:
-        try:
-            import matplotlib.pyplot as plt
-
-            total = counts.sum()
-            if total > 0:
-                weights = counts / total
-                curve_expl = (M_expl * weights[:, None]).sum(axis=0)
-                curve_rand = (M_rand * weights[:, None]).sum(axis=0)
-            else:
-                curve_expl = M_expl.mean(axis=0)
-                curve_rand = M_rand.mean(axis=0)
-
-            plt.figure(figsize=(6, 4))
-            plt.plot(alphas, curve_expl, label="explanation")
-            plt.plot(alphas, curve_rand, label="random", linestyle="--")
-            plt.xlabel("Perturbation ratio")
-            plt.ylabel("Logit")
-            plt.title("AOPCR curves (weighted mean logits)")
-            plt.grid(alpha=0.3)
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(args.aopcr_plot_path, dpi=200)
-            plt.close()
-            print(f"Saved AOPCR plot to {args.aopcr_plot_path}")
-        except ImportError:
-            print("matplotlib not installed; skipping AOPCR plot")
 
     print("\n===== Class-wise AOPCR =====")
     for c in range(args.num_classes):
@@ -443,18 +313,6 @@ def main():
     print("\n===== Average AOPCR =====")
     print(f"Weighted Average AOPCR: {aopcr_w_avg:.6f}")
     print(f"Mean AOPCR: {aopcr_mean:.6f}")
-    if aopcr_overall is not None:
-        print(f"Overall AOPCR (original dataset): {aopcr_overall:.6f}")
-
-    # Coverage metrics
-    print("\n===== Coverage Metrics =====")
-    print("(Coverage@X = % of instances needed to maintain X% of original performance)")
-    for thr in sorted(coverage_summary.keys(), reverse=True):
-        cov = coverage_summary[thr]
-        print(f"\nCoverage@{thr:.0%}:")
-        print(f"  Explanation: {cov['expl_mean']:.4f} (weighted: {cov['expl_weighted']:.4f})")
-        print(f"  Random:      {cov['rand_mean']:.4f} (weighted: {cov['rand_weighted']:.4f})")
-        print(f"  Gain:        {cov['coverage_gain']:.4f} (explanation better than random)")
 
 
 if __name__ == '__main__':
