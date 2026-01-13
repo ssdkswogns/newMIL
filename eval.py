@@ -285,6 +285,10 @@ def main():
     parser.add_argument('--embed', default=128, type=int, help='Number of embedding')
     parser.add_argument('--batchsize', default=64, type=int, help='batchsize')
     parser.add_argument('--num_random', default=3, type=int, help='Random baseline repetition for AOPCR')
+    parser.add_argument('--aopcr_stop', default=0.5, type=float,
+                        help='AOPCR perturbation limit (0.0-1.0). Default 0.5 (50%%). Use 1.0 for full range.')
+    parser.add_argument('--aopcr_step', default=0.05, type=float,
+                        help='AOPCR perturbation step size. Default 0.05 (5%%).')
     parser.add_argument('--dropout_node', default=0.0, type=float, help='Dropout rate for classifier heads')
     parser.add_argument('--millet_pooling', default="conjunctive", type=str,
                         help="MILLET pooling method: conjunctive | attention | instance | additive | gap")
@@ -330,16 +334,18 @@ def main():
     print("Instance accuracy:", inst_acc)
 
     # AOPCR
-    print("Computing class-wise AOPCR ...")
-    aopcr_c, aopcr_w_avg, aopcr_mean, aopcr_overall, M_expl, M_rand, alphas, counts = compute_classwise_aopcr(
+    print(f"Computing class-wise AOPCR (stop={args.aopcr_stop}, step={args.aopcr_step}) ...")
+    result = compute_classwise_aopcr(
         milnet,
         testloader,
         args,
-        stop=0.5,
-        step=0.05,
+        stop=args.aopcr_stop,
+        step=args.aopcr_step,
         n_random=args.num_random,
-        pred_threshold=0.5
+        pred_threshold=0.5,
+        coverage_thresholds=[0.9, 0.8, 0.7, 0.5]
     )
+    aopcr_c, aopcr_w_avg, aopcr_mean, aopcr_overall, M_expl, M_rand, alphas, counts, coverage_summary = result
 
     print("\n===== Class-wise AOPCR =====")
     for c in range(args.num_classes):
@@ -356,6 +362,16 @@ def main():
     print(f"Mean AOPCR: {aopcr_mean:.6f}")
     if aopcr_overall is not None:
         print(f"Overall AOPCR (original dataset): {aopcr_overall:.6f}")
+
+    # Coverage metrics
+    print("\n===== Coverage Metrics =====")
+    print("(Coverage@X = % of instances needed to maintain X% of original performance)")
+    for thr in sorted(coverage_summary.keys(), reverse=True):
+        cov = coverage_summary[thr]
+        print(f"\nCoverage@{thr:.0%}:")
+        print(f"  Explanation: {cov['expl_mean']:.4f} (weighted: {cov['expl_weighted']:.4f})")
+        print(f"  Random:      {cov['rand_mean']:.4f} (weighted: {cov['rand_weighted']:.4f})")
+        print(f"  Gain:        {cov['coverage_gain']:.4f} (explanation better than random)")
 
 
 if __name__ == '__main__':

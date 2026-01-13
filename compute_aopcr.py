@@ -90,6 +90,8 @@ def compute_classwise_aopcr(
     step: float = 0.05,
     n_random: int = 3,
     pred_threshold: float = 0.5,
+    coverage_thresholds: list = None,
+    rng: torch.Generator = None,
 ):
     """
     TimeMIL / newTimeMIL / AmbiguousMIL 에 대해
@@ -99,9 +101,21 @@ def compute_classwise_aopcr(
     - attn_layer2는 test 코드와 동일한 방식으로 파싱
     - 각 bag에서 (1) label이 0.5 이상인 클래스들, 없으면
       (2) 예측 argmax 클래스를 대상으로 curve를 계산
+
+    Args:
+        stop: Perturbation limit (0.0 to 1.0). Default 0.5 (50%).
+        step: Perturbation step size. Default 0.05 (5%).
+        coverage_thresholds: List of coverage thresholds to compute (e.g., [0.1, 0.2, 0.5]).
+                           Coverage@X = % of instances needed to maintain X proportion of original performance.
     """
     device = next(milnet.parameters()).device
     num_classes = args.num_classes
+    # 별도의 RNG를 넘기지 않으면 기존 글로벌 RNG를 그대로 사용
+    rng = rng or None
+
+    # Default coverage thresholds if not provided
+    if coverage_thresholds is None:
+        coverage_thresholds = [0.9, 0.8, 0.7, 0.5]  # Keep 90%, 80%, 70%, 50% of original performance
 
     # perturbation 비율 (0% ~ stop까지 step 간격)
     # alphas[0] = 0 (no perturb), alphas[1:] = 실제 perturb
@@ -113,6 +127,11 @@ def compute_classwise_aopcr(
     counts = torch.zeros(num_classes, device=device)          # class별 bag 개수
     M_expl = torch.zeros(num_classes, n_steps, device=device) # class별 explanation curve 평균
     M_rand = torch.zeros(num_classes, n_steps, device=device) # class별 random curve 평균
+
+    # Coverage 통계: 각 threshold에서 필요한 인스턴스 비율
+    # coverage_stats[class][threshold_idx] = average % of instances needed
+    coverage_stats_expl = {thr: torch.zeros(num_classes, device=device) for thr in coverage_thresholds}
+    coverage_stats_rand = {thr: torch.zeros(num_classes, device=device) for thr in coverage_thresholds}
 
     milnet.eval()
 
@@ -264,7 +283,7 @@ def compute_classwise_aopcr(
 
                     # ---- 랜덤 기반 (rand) ----
                     for r in range(n_random):
-                        rand_perm = torch.randperm(T, device=device)
+                        rand_perm = torch.randperm(T, device=device, generator=rng)
                         idx_remove_rand = rand_perm[:k]
                         x_pert_rand = x[b:b+1].clone()
                         x_pert_rand[:, idx_remove_rand, :] = 0.0
@@ -293,11 +312,42 @@ def compute_classwise_aopcr(
                 M_expl[pred_c] += drop_expl
                 M_rand[pred_c] += drop_rand
 
+                # ----- Coverage 계산: 각 threshold에서 필요한 인스턴스 비율 -----
+                # Coverage@X = 원본 성능의 X%를 유지하는데 필요한 인스턴스 비율
+                for thr in coverage_thresholds:
+                    target_logit = orig_logit * thr  # X% 성능 유지 목표
+
+                    # Explanation-based coverage
+                    # curve_expl이 target_logit 이상을 유지하는 마지막 step 찾기
+                    mask_expl = curve_expl >= target_logit
+                    if mask_expl.any():
+                        last_valid_step = mask_expl.nonzero(as_tuple=False).max().item()
+                        coverage_expl = alphas[last_valid_step].item()
+                    else:
+                        coverage_expl = 0.0  # 유지 불가능
+
+                    # Random-based coverage (평균)
+                    curve_rand_mean = curves_rand.mean(dim=0)
+                    mask_rand = curve_rand_mean >= target_logit
+                    if mask_rand.any():
+                        last_valid_step = mask_rand.nonzero(as_tuple=False).max().item()
+                        coverage_rand = alphas[last_valid_step].item()
+                    else:
+                        coverage_rand = 0.0
+
+                    coverage_stats_expl[thr][pred_c] += coverage_expl
+                    coverage_stats_rand[thr][pred_c] += coverage_rand
+
     # ----- 클래스별 평균 및 전체 요약 -----
     valid = counts > 0
     aopcr_per_class[valid] /= counts[valid]                  # per-class 평균
     M_expl[valid] /= counts[valid].unsqueeze(1)
     M_rand[valid] /= counts[valid].unsqueeze(1)
+
+    # Coverage 통계 평균화
+    for thr in coverage_thresholds:
+        coverage_stats_expl[thr][valid] /= counts[valid]
+        coverage_stats_rand[thr][valid] /= counts[valid]
 
     # weighted 평균 (bag 수로 가중)
     total = counts.sum()
@@ -317,6 +367,36 @@ def compute_classwise_aopcr(
         total_bags = counts.sum().item()
         aopcr_overall_mean = total_aopcr_sum / total_bags
 
+    # Coverage 통계를 딕셔너리로 정리
+    coverage_summary = {}
+    for thr in coverage_thresholds:
+        expl_per_class = coverage_stats_expl[thr].cpu().numpy()
+        rand_per_class = coverage_stats_rand[thr].cpu().numpy()
+
+        # Weighted average
+        if total > 0:
+            expl_weighted = (coverage_stats_expl[thr] * weights).sum().item()
+            rand_weighted = (coverage_stats_rand[thr] * weights).sum().item()
+        else:
+            expl_weighted = rand_weighted = 0.0
+
+        # Simple mean (valid classes only)
+        if valid.any():
+            expl_mean = coverage_stats_expl[thr][valid].mean().item()
+            rand_mean = coverage_stats_rand[thr][valid].mean().item()
+        else:
+            expl_mean = rand_mean = 0.0
+
+        coverage_summary[thr] = {
+            'expl_per_class': expl_per_class,
+            'rand_per_class': rand_per_class,
+            'expl_weighted': expl_weighted,
+            'rand_weighted': rand_weighted,
+            'expl_mean': expl_mean,
+            'rand_mean': rand_mean,
+            'coverage_gain': expl_mean - rand_mean,  # How much better than random
+        }
+
     return (
         aopcr_per_class.cpu().numpy(),  # per-class AOPCR (C,)
         aopcr_weighted,                 # weighted average AOPCR (scalar)
@@ -326,4 +406,5 @@ def compute_classwise_aopcr(
         M_rand.cpu().numpy(),           # class-wise random curves (C, n_steps)
         alphas.cpu().numpy(),           # perturbation ratios (n_steps,)
         counts.cpu().numpy(),           # per-class bag counts (C,)
+        coverage_summary,               # coverage metrics at various thresholds
     )

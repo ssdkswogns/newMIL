@@ -23,6 +23,10 @@ CLASS_RE = re.compile(
 )
 BEST_RE = re.compile(r"Best Results \|", re.IGNORECASE)
 METRIC_KV_RE = re.compile(r"([A-Za-z0-9_()/]+)=([0-9eE+\-\.]+)")
+COVERAGE_RE = re.compile(r"Coverage@(\d+)%:")
+COVERAGE_DETAIL_RE = re.compile(
+    r"(Explanation|Random|Gain):\s*([0-9eE+\-\.]+)\s*\(.*?([0-9eE+\-\.]+)\)"
+)
 
 
 def parse_log(log_path: Path) -> Dict[str, Optional[Dict]]:
@@ -31,6 +35,8 @@ def parse_log(log_path: Path) -> Dict[str, Optional[Dict]]:
     current_classes: List[Dict] = []
     best_block: Optional[Dict] = None
     fallback_metrics: Optional[Dict] = None  # e.g., ED1NN lines without "Best Results"
+    coverage_blocks: List[Dict] = []
+    current_coverage: Optional[Dict] = None
     lines = log_path.read_text(errors="ignore").splitlines()
 
     for line in lines:
@@ -68,6 +74,29 @@ def parse_log(log_path: Path) -> Dict[str, Optional[Dict]]:
             current_classes = []
             continue
 
+        # Coverage section start
+        m_cov = COVERAGE_RE.search(line)
+        if m_cov:
+            threshold = int(m_cov.group(1)) / 100.0
+            current_coverage = {"threshold": threshold}
+            continue
+
+        # Coverage detail lines
+        if current_coverage is not None:
+            m_cov_detail = COVERAGE_DETAIL_RE.search(line)
+            if m_cov_detail:
+                metric_type = m_cov_detail.group(1).lower()
+                mean_val = float(m_cov_detail.group(2))
+                weighted_val = float(m_cov_detail.group(3))
+                current_coverage[f"{metric_type}_mean"] = mean_val
+                current_coverage[f"{metric_type}_weighted"] = weighted_val
+
+                # If we have all three metrics, save the block
+                if "gain_mean" in current_coverage:
+                    coverage_blocks.append(current_coverage)
+                    current_coverage = None
+                continue
+
         # Fallback metric line (e.g., ED1NN logs)
         metric_pairs = METRIC_KV_RE.findall(line)
         if metric_pairs and best_block is None:
@@ -82,6 +111,7 @@ def parse_log(log_path: Path) -> Dict[str, Optional[Dict]]:
     return {
         "best": best_block,
         "aopcr": aopcr_blocks[-1] if aopcr_blocks else None,
+        "coverage": coverage_blocks if coverage_blocks else None,
     }
 
 
@@ -202,6 +232,7 @@ def main():
         parsed = parse_log(log_path)
         best = parsed.get("best")
         aopcr = parsed.get("aopcr")
+        coverage = parsed.get("coverage")
 
         print(f"\n[{dataset}] {log_path.parent.name} | {log_path}")
         if opt_path and args.match_options:
@@ -233,6 +264,16 @@ def main():
                     )
         else:
             print("  AOPCR: (not found)")
+
+        # Coverage metrics
+        if coverage:
+            print("  Coverage Metrics:")
+            for cov in sorted(coverage, key=lambda x: x["threshold"], reverse=True):
+                thr = cov["threshold"]
+                print(f"    Coverage@{thr:.0%}:")
+                print(f"      Expl: {cov.get('explanation_mean', 0):.4f} (w: {cov.get('explanation_weighted', 0):.4f})")
+                print(f"      Rand: {cov.get('random_mean', 0):.4f} (w: {cov.get('random_weighted', 0):.4f})")
+                print(f"      Gain: {cov.get('gain_mean', 0):.4f}")
 
 
 if __name__ == "__main__":

@@ -48,6 +48,39 @@ from os.path import join
 # Suppress all warnings
 warnings.filterwarnings("ignore")
 
+# ---------------------------------------------------------------------
+#   Reproducibility helpers
+# ---------------------------------------------------------------------
+def seed_everything(seed: int, deterministic: bool = True):
+    """
+    Seed python, numpy, torch (CPU/GPU) and toggle deterministic options.
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    # disable TF32 to avoid tiny run-to-run drift on Ampere+
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = False
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception:
+        # Some torch versions or ops may not support strict determinism; keep going.
+        pass
+
+
+def seed_worker(worker_id: int):
+    """Ensure numpy/python RNGs are also seeded inside dataloader workers."""
+    worker_seed = (torch.initial_seed() + worker_id) % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 # ----- DDP utils -----
 def setup_distributed():
     """
@@ -72,20 +105,6 @@ def setup_distributed():
 def cleanup_distributed():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
-
-# ---------------------------------------------------------------------
-#   Seed
-# ---------------------------------------------------------------------
-seed = 42
-
-random.seed(seed)             # python random
-np.random.seed(seed)          # numpy random
-torch.manual_seed(seed)       # CPU
-torch.cuda.manual_seed(seed)  # GPU 단일
-torch.cuda.manual_seed_all(seed)  # multi-GPU
-
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 # ---------------------------------------------------------------------
 #   PrototypeBank & Losses
@@ -875,10 +894,7 @@ def main():
 
     # rank별 seed 다르게
     base_seed = args.seed
-    random.seed(base_seed + rank)
-    np.random.seed(base_seed + rank)
-    torch.manual_seed(base_seed + rank)
-    torch.cuda.manual_seed_all(base_seed + rank)
+    seed_everything(base_seed + rank)
 
     # ----- 디렉토리 / wandb / logger -----
     args.save_dir = args.save_dir + 'InceptBackbone'
@@ -1152,15 +1168,18 @@ def main():
         test_sampler  = None
         shuffle_train = True
 
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(base_seed + rank)
+
     trainloader = DataLoader(
         trainset, batch_size=batch, shuffle=shuffle_train,
         num_workers=args.num_workers, drop_last=False, pin_memory=True,
-        sampler=train_sampler
+        sampler=train_sampler, worker_init_fn=seed_worker, generator=loader_generator
     )
     testloader = DataLoader(
         testset, batch_size=1, shuffle=False,
         num_workers=args.num_workers, drop_last=False, pin_memory=True,
-        sampler=test_sampler
+        sampler=test_sampler, worker_init_fn=seed_worker, generator=loader_generator
     )
 
     def _four_sig(val: float):
@@ -1400,12 +1419,17 @@ def main():
                     )
 
             # AOPCR with batch_size=1 for perturbation routine
+            aopcr_loader_gen = torch.Generator()
+            aopcr_loader_gen.manual_seed(base_seed + rank + 999)
+            aopcr_rng = torch.Generator(device=device)
+            aopcr_rng.manual_seed(base_seed + rank + 999)
             testloader_aopcr = DataLoader(
                 testset, batch_size=1, shuffle=False,
-                num_workers=args.num_workers, drop_last=False, pin_memory=True
+                num_workers=args.num_workers, drop_last=False, pin_memory=True,
+                worker_init_fn=seed_worker, generator=aopcr_loader_gen
             )
             print("Computing class-wise AOPCR with best model ...")
-            aopcr_c, aopcr_w_avg, aopcr_mean, aopcr_sum, M_expl, M_rand, alphas, counts = compute_classwise_aopcr(
+            aopcr_c, aopcr_w_avg, aopcr_mean, aopcr_sum, M_expl, M_rand, alphas, counts, _coverage = compute_classwise_aopcr(
                 eval_model,
                 testloader_aopcr,
                 args,
@@ -1413,6 +1437,7 @@ def main():
                 step=0.05,
                 n_random=3,
                 pred_threshold=0.5,
+                rng=aopcr_rng,
             )
             for c in range(args.num_classes):
                 name = str(c)
