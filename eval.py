@@ -309,7 +309,7 @@ def main():
     parser.add_argument('--num_workers', default=4, type=int, help='number of workers used in dataloader')
     parser.add_argument('--feats_size', default=512, type=int, help='Dimension of the feature size')
     parser.add_argument('--gpu_index', type=int, nargs='+', default=(0,), help='GPU ID(s) [0]')
-    parser.add_argument('--seed', default=0, type=int, help='random seed')
+    parser.add_argument('--seed', default=42, type=int, help='random seed')
     parser.add_argument('--model', default='newTimeMIL', type=str,
                         help='MIL model: TimeMIL | newTimeMIL | AmbiguousMIL | HybridMIL | ContextualMIL | MILLET')
     parser.add_argument('--model_path', default='./savemodel/InceptBackbone/BasicMotions/exp_7/weights/best_newTimeMIL.pth',
