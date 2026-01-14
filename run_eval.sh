@@ -16,7 +16,7 @@ DATASETS=(
   # "Heartbeat"
   "Libras"
   "LSST"
-  # "MotorImagery"
+  "MotorImagery"
   "NATOPS"
   "PenDigits"
   "PEMS-SF"
@@ -24,13 +24,13 @@ DATASETS=(
   "RacketSports"
   "SelfRegulationSCP1"
   "SelfRegulationSCP2"
-#   "StandWalkJump"
+  "StandWalkJump"
   "UWaveGestureLibrary"
   # "JapaneseVowels"
 )
 # 반복 실행
 for d in "${DATASETS[@]}"; do
-  latest_exp_dir=$(ls -d "./savemodel/InceptBackbone/$d"/exp_* 2>/dev/null | sort -V | tail -n 3 | head -n 1)
+  latest_exp_dir=$(ls -d "./savemodel/InceptBackbone/$d"/exp_* 2>/dev/null | sort -V | tail -n 2 | head -n 1)
   if [[ -z "$latest_exp_dir" ]]; then
     echo "Skipping $d (no exp_* directory found)"
     continue

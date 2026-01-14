@@ -135,8 +135,9 @@ def compute_classwise_aopcr(
             out = milnet(x)
             if not isinstance(out, (tuple, list)):
                 raise ValueError("AmbiguousMIL output must be a tuple/list")
-            logits, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = out
-            prob = instance_pred  # bag-level prob from instance logits
+            prototype_logits, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = out
+            logits = instance_pred
+            prob = torch.sigmoid(instance_pred)  # bag-level prob from instance logits
             instance_logits = weighted_instance_pred
         elif args.model == 'TimeMIL':
             out = milnet(x)
@@ -214,7 +215,10 @@ def compute_classwise_aopcr(
 
                     out_expl = milnet(x_pert_expl)
                     if isinstance(out_expl, tuple):
-                        logits_expl = out_expl[0]              # (logits, ...) 형태
+                        if args.model == 'AmbiguousMIL':
+                            logits_expl = out_expl[1]    # (prototype_logits, instance_pred, ...)
+                        else:
+                            logits_expl = out_expl[0]              # (logits, ...) 형태
                     else:
                         logits_expl = out_expl
                     curve_expl[step_i] = logits_expl[0, pred_c].item()
@@ -228,7 +232,10 @@ def compute_classwise_aopcr(
 
                         out_rand = milnet(x_pert_rand)
                         if isinstance(out_rand, tuple):
-                            logits_rand = out_rand[0]
+                            if args.model == 'AmbiguousMIL':
+                                logits_rand = out_rand[1]    # (prototype_logits, instance_pred, ...)
+                            else:
+                                logits_rand = out_rand[0]              # (logits, ...) 형태
                         else:
                             logits_rand = out_rand
                         curves_rand[r, step_i] = logits_rand[0, pred_c].item()

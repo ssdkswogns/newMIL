@@ -39,5 +39,5 @@ DATASETS=(
 for dataset in "${DATASETS[@]}"; do
     echo "Running TimeMIL on dataset: $dataset"
     # CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29600 main_cl_fix.py --dataset $dataset --model AmbiguousMIL --datatype mixed --bag_loss_w 0.5 --inst_loss_w 0.2 --ortho_loss_w 0.0 --smooth_loss_w 0.05 --sparsity_loss_w 0.05 --proto_loss_w 0.2 --cls_contrast_w 0.1
-    CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=29600 main_cl_exp.py --dataset $dataset --model AmbiguousMIL --datatype mixed --bag_loss_w 0.4 --inst_loss_w 0.4 --sparsity_loss_w 0.0 --proto_loss_w 0.2 --epoch_des 20 --num_epochs 1500 --proto_win 10 --proto_tau 0.2 --proto_sim_thresh 0.7
+    CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 --master_port=29500 main_cl_exp.py --dataset $dataset --model AmbiguousMIL --datatype mixed --bag_loss_w 0.4 --inst_loss_w 0.4 --proto_loss_w 0.2 --epoch_des 20 --num_epochs 1500 --proto_win 10 --proto_tau 0.2
 done

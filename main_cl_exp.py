@@ -320,8 +320,8 @@ def instance_prototype_contrastive_loss(
     S_valid = S_full.clone()
 
     # valid class: bag_label=1 AND prototype initialized
-    valid_class_mask = initialized.view(1,1,C)
-    # valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B,1,C]
+    # valid_class_mask = initialized.view(1,1,C)
+    valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B,1,C]
     S_valid = S_valid.masked_fill(~valid_class_mask, -1e9)
 
     # 3. direct non-ambiguous: per (b,t)에서 class 최대
@@ -1000,7 +1000,7 @@ def main():
         optimizer = Lookahead(optimizer, alpha=0.5, k=5)
 
     # ---------------- Batch size ----------------
-    if args.dataset in ['DuckDuckGeese','PenDigits','FingerMovements','BasicMotions','ERing','EigenWorms','HandMovementDirection','RacketSports','UWaveGestureLibrary']:
+    if args.dataset in ['DuckDuckGeese','PenDigits','FingerMovements','ERing','EigenWorms','HandMovementDirection','RacketSports','UWaveGestureLibrary']:
         batch = 64
     elif args.dataset in ['Heartbeat']:
         batch = 32
@@ -1010,9 +1010,9 @@ def main():
         batch = 8
     elif args.dataset in ['StandWalkJump']:
         batch = 1
-    elif args.dataset in ['Libras','Handwriting','Epilepsy','ArticularyWordRecognition','PhonemeSpectra']:
+    elif args.dataset in ['Libras','Handwriting','Epilepsy']:
         batch = 128
-    elif args.dataset in ['FaceDetection','LSST']:
+    elif args.dataset in ['FaceDetection','LSST','ArticularyWordRecognition','BasicMotions','PhonemeSpectra']:
         batch = 512
     else:
         batch = args.batchsize
@@ -1034,7 +1034,7 @@ def main():
         sampler=train_sampler
     )
     testloader = DataLoader(
-        testset, batch_size=1, shuffle=False,
+        testset, batch_size=batch, shuffle=False,
         num_workers=args.num_workers, drop_last=False, pin_memory=True,
         sampler=test_sampler
     )
