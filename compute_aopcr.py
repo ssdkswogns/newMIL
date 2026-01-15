@@ -16,11 +16,10 @@ from syntheticdataset import *
 from utils import *
 from mydataload import loadorean
 
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
+from models.AmbiguousMIL import AmbiguousMILwithCL
 from models.milet import MILLET
 from models.MLSTM_FCN import MLSTM_FCN
 from models.os_cnn import OS_CNN
-from models.hybridmil import HybridMIL, ContextualMIL
 
 warnings.filterwarnings("ignore")
 
@@ -41,14 +40,14 @@ def extract_attn_importance(attn_layer2: torch.Tensor,
                             model_name: str,
                             args) -> torch.Tensor:
     """
-    TimeMIL / newTimeMIL / AmbiguousMIL 공통으로
+    AmbiguousMIL 공통으로
     'class-token → time-token' attention 기반 중요도 score[t]를 뽑는 함수.
 
     attn_layer2: [B, H, L, L] 또는 [B, L, L]
     T: 시퀀스 길이
     num_classes: 클래스 개수
     target_c: 중요도를 볼 target class index
-    model_name: 'TimeMIL' / 'newTimeMIL' / 'AmbiguousMIL'
+    model_name: 'AmbiguousMIL'
     return: [B, T]  (각 timestep 중요도)
     """
     # 1) head 평균해서 [B, L, L]로 통일
@@ -66,16 +65,12 @@ def extract_attn_importance(attn_layer2: torch.Tensor,
 
     C = args.num_classes
     cls_idx = target_c
-    if model_name in ['newTimeMIL','AmbiguousMIL']:
+    if model_name in ['AmbiguousMIL']:
         # query = class tokens (0..C_att-1), key = time tokens (C_att..C_att+T-1)
         attn_cls2time = attn[:, :C, C:]     # [B, C_att, T]
 
         # target class에 해당하는 class token만 선택
         scores = attn_cls2time[:, cls_idx, :]              # [B, T]
-    elif model_name == 'TimeMIL': # Single class token
-        # query = class token (0), key = time tokens (1..T)
-        attn_cls2time = attn[:, 0:1, 1:]    # [B, 1, T]
-        scores = attn_cls2time[:, 0, :]                     # [B, T]
     return scores
 
 
@@ -95,7 +90,7 @@ def compute_classwise_aopcr(
     rng: torch.Generator = None,
 ):
     """
-    TimeMIL / newTimeMIL / AmbiguousMIL 에 대해
+    AmbiguousMIL / MILLET / OS_CNN / MLSTM_FCN 에 대해
     'class-wise AOPCR'을 계산하는 함수 (multi-label 대응).
 
     - instance는 제거하지 않고 0으로 마스킹만 함
@@ -137,6 +132,7 @@ def compute_classwise_aopcr(
     milnet.eval()
 
     total_aopcr_sum = 0.0
+    aopcr_overall_mean = None
 
     for batch in testloader:
         # testloader: (feats, label, y_inst) 구조라고 가정 (지금 코드랑 동일)
@@ -153,45 +149,18 @@ def compute_classwise_aopcr(
         batch_size, T, D = x.shape
 
         # ----- 모델 forward (현재 메커니즘) -----
-        hybrid_head = getattr(args, "hybrid_bag_head", "tp")
-
         if args.model == 'AmbiguousMIL':
             out = milnet(x)
-            if not isinstance(out, (tuple, list)):
-                raise ValueError("AmbiguousMIL output must be a tuple/list")
-            logits, instance_logits, x_cls, x_seq, _c_seq, attn_layer1, attn_layer2 = out
-            prob = torch.sigmoid(logits)
-            interpretation = None
-            non_weighted_instance_logit = None
-        elif args.model == 'TimeMIL':
-            out = milnet(x)
-            logits, attn_layer1, attn_layer2 = out
-            prob = torch.sigmoid(logits)
-            instance_logits = None
-            interpretation = None
-            non_weighted_instance_logit = None
-        elif args.model == 'newTimeMIL':
-            out = milnet(x)
-            logits, x_cls, attn_layer1, attn_layer2 = out
-            prob = torch.sigmoid(logits)
-            instance_logits = None
-            interpretation = None
-            non_weighted_instance_logit = None
-        elif args.model in ['HybridMIL', 'ContextualMIL']:
-            out = milnet(x)
             if not isinstance(out, (tuple, list)) or len(out) < 4:
-                raise ValueError("Hybrid/ContextualMIL output must be a tuple/list")
-            bag_logits_ts, bag_logits_tp, weighted_logits, inst_logits = out[:4]
-            logits = bag_logits_tp if hybrid_head != "ts" else bag_logits_ts
+                raise ValueError("AmbiguousMIL output must be a tuple/list")
+            bag_logits_ts, bag_logits_tp, weighted_instance_logits, inst_logits = out[:4]
+            logits = bag_logits_tp                      # bag prediction (conjunctive TP head)
+            instance_logits = weighted_instance_logits  # [B, T, C] importance map
             prob = torch.sigmoid(logits)
-            instance_logits = weighted_logits  # [B, T, C]
             interpretation = None
-            non_weighted_instance_logit = None
-            attn_layer1 = attn_layer2 = None
         elif args.model == 'MILLET':
-            logits, non_weighted_instance_logit, instance_logits = milnet(x)
+            logits, instance_logits, interpretation = milnet(x)  # instance_logits: [B, T, C]
             prob = torch.sigmoid(logits)
-            interpretation = None
         elif args.model == 'MLSTM_FCN':
             out = milnet(x, return_cam=True)
             if isinstance(out, (tuple, list)) and len(out) == 2:
@@ -200,8 +169,6 @@ def compute_classwise_aopcr(
                 raise ValueError("MLSTM_FCN expected to return (logits, cam)")
             prob = torch.sigmoid(logits)
             instance_logits = None
-            non_weighted_instance_logit = None
-            attn_layer1 = attn_layer2 = None
         elif args.model == 'OS_CNN':
             out = milnet(x, return_cam=True)
             if isinstance(out, (tuple, list)) and len(out) == 2:
@@ -210,8 +177,6 @@ def compute_classwise_aopcr(
                 raise ValueError("OS_CNN expected to return (logits, cam)")
             prob = torch.sigmoid(logits)
             instance_logits = None
-            non_weighted_instance_logit = None
-            attn_layer1 = attn_layer2 = None
         else:
             raise ValueError(f"Unknown model name: {args.model}")
 
@@ -235,29 +200,11 @@ def compute_classwise_aopcr(
 
                 # ----- timestep 중요도 score 계산 -----
                 if args.model == 'AmbiguousMIL' and instance_logits is not None:
-                    # instance_logits: [B, T, C] -> softmax 후 target class prob 사용
-                    # s_all = torch.softmax(instance_logits[b], dim=-1)   # [T, C]
-                    s_all = instance_logits[b]   # [T, C]
-                    scores = s_all[:, pred_c]                           # [T]
-                elif args.model in ['HybridMIL', 'ContextualMIL']:
-                    # weighted instance logits [B, T, C]
-                    scores = instance_logits[b, :, pred_c]
-                elif args.model in ['TimeMIL', 'newTimeMIL']:
-                    scores = extract_attn_importance(
-                        attn_layer2=attn_layer2,
-                        T=T,
-                        num_classes=num_classes,
-                        target_c=pred_c,
-                        model_name=args.model,
-                        args=args
-                    )[b]
-                elif args.model == 'MILLET':
-                    # if instance_logits is not None: # [B, C, T]
-                    #     scores = instance_logits[b, pred_c, :]
-                    #     scores = torch.softmax(instance_logits[b], dim=1)[pred_c,:]  # [T]
-                    if non_weighted_instance_logit is not None: # [B, T, C]
-                        scores = non_weighted_instance_logit[b, :, pred_c]
-                        # scores = torch.softmax(non_weighted_instance_logit[b], dim=1)[:,pred_c]  # [T]
+                    # instance_logits: [B, T, C] (weighted logits)
+                    scores = instance_logits[b, :, pred_c]              # [T]
+                elif args.model == 'MILLET' and interpretation is not None:
+                    # instance_logits: [B, T, C]
+                    scores = interpretation[b, :, pred_c]
                 elif args.model in ['MLSTM_FCN', 'OS_CNN']:
                     if interpretation is None:
                         raise ValueError(f"{args.model} needs CAM interpretation for AOPCR")
@@ -295,10 +242,11 @@ def compute_classwise_aopcr(
 
                     out_expl = milnet(x_pert_expl)
                     if isinstance(out_expl, tuple):
-                        if args.model in ['HybridMIL', 'ContextualMIL']:
-                            logits_expl = out_expl[1] if getattr(args, "hybrid_bag_head", "tp") != "ts" else out_expl[0] # [B, T, C]
+                        # AmbiguousMIL returns (bag_ts, bag_tp, ...)
+                        if args.model == 'AmbiguousMIL':
+                            logits_expl = out_expl[1]          # TP head
                         else:
-                            logits_expl = out_expl[0]              # (logits, ...) 형태
+                            logits_expl = out_expl[0]
                     else:
                         logits_expl = out_expl
                     curve_expl[step_i] = logits_expl[0, pred_c].item() # [C]
@@ -312,8 +260,8 @@ def compute_classwise_aopcr(
 
                         out_rand = milnet(x_pert_rand)
                         if isinstance(out_rand, tuple):
-                            if args.model in ['HybridMIL', 'ContextualMIL']:
-                                logits_rand = out_rand[1] if getattr(args, "hybrid_bag_head", "tp") != "ts" else out_rand[0]
+                            if args.model == 'AmbiguousMIL':
+                                logits_rand = out_rand[1]      # TP head
                             else:
                                 logits_rand = out_rand[0]
                         else:
@@ -390,7 +338,7 @@ def compute_classwise_aopcr(
 
     if args.datatype == 'original':
         total_bags = counts.sum().item()
-        aopcr_overall_mean = total_aopcr_sum / total_bags
+        aopcr_overall_mean = total_aopcr_sum / total_bags if total_bags > 0 else 0.0
 
     # Coverage 통계를 딕셔너리로 정리
     coverage_summary = {}

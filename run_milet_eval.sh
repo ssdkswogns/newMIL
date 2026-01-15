@@ -6,31 +6,6 @@ ROOT="./savemodel/millet_mixed_data"
 # 비워두면 ROOT 아래 모든 폴더를 자동 수집.
 RETRY_DATASETS=(
   "ArticularyWordRecognition"
-  # "AtrialFibrillation"
-  "BasicMotions"
-  "Cricket"
-  "DuckDuckGeese"
-  "Epilepsy"
-  # "EthanolConcentration"
-  "ERing"
-  "FaceDetection"
-  "FingerMovements"
-  "HandMovementDirection"
-  "Handwriting"
-  # "Heartbeat"
-  "Libras"
-  "LSST"
-  # "MotorImagery"
-  "NATOPS"
-  "PenDigits"
-  "PEMS-SF"
-  "PhonemeSpectra"
-  "RacketSports"
-  "SelfRegulationSCP1"
-  "SelfRegulationSCP2"
-  "StandWalkJump"
-  "UWaveGestureLibrary"
-  # "JapaneseVowels"
 )
 
 # dataset 리스트 결정
@@ -63,15 +38,18 @@ for d in "${DATASETS[@]}"; do
 
   echo "Evaluating $d using $model_path"
 
-  plot_path="$latest_exp_dir/aopcr_curve_${d}.png"
+  plot_path="$latest_exp_dir/aopcr_curve_0.5_${d}.png"
+  log_path="$latest_exp_dir/eval_${d}.log"
 
   python eval.py --dataset "$d" --model MILLET \
-    --aopcr_stop 0.8 \
+    --aopcr_stop 0.5 \
     --aopcr_step 0.05 \
     --model_path "$model_path" \
     --embed 128 --dropout_node 0.1 --millet_pooling conjunctive \
     --datatype mixed --batchsize 64 --cls_threshold 0.5 --num_random 3 --gpu_index 0 \
+    --num_workers 0 \
+    --class_order meta \
     --plot_aopcr \
     --aopcr_plot_path "$plot_path" \
-    --seed 0
+    --seed 0 | tee "$log_path"
 done

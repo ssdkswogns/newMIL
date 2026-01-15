@@ -4,17 +4,8 @@ import numpy as np
 import random
 from typing import Dict, List, Tuple, Union
 
-seed = 42
-
-random.seed(seed)             # python random
-np.random.seed(seed)          # numpy random
-torch.manual_seed(seed)       # CPU
-torch.cuda.manual_seed(seed)  # GPU 단일
-torch.cuda.manual_seed_all(seed)  # multi-GPU
-
-# 재현성을 위한 옵션들
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+# NOTE: Global seed initialization removed to allow per-run randomness
+# Each Dataset class handles seeding internally via its own seed parameter
 
 def _rand_partition(total_len: int, k: int, min_seg: int = 16) -> List[int]:
     assert k * min_seg <= total_len

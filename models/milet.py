@@ -22,7 +22,7 @@ class PositionalEncoding(nn.Module):
     https://pytorch.org/tutorials/beginner/transformer_tutorial.html
     """
 
-    def __init__(self, d_model: int, max_len: int = 5000) -> None:
+    def __init__(self, d_model: int, max_len: int = 9000) -> None:
         super().__init__()
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
@@ -32,13 +32,68 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
         self.pe: torch.Tensor
 
+    def _extend_pe(self, new_max_len: int, device: torch.device, dtype: torch.dtype) -> None:
+        """
+        Extend the sinusoidal table on the fly if we encounter sequences longer
+        than the precomputed buffer (e.g., synthetic bags concatenating multiple
+        sequences).
+        """
+        if (
+            new_max_len <= self.pe.size(1)
+            and self.pe.device == device
+            and self.pe.dtype == dtype
+        ):
+            return
+
+        d_model = self.pe.size(2)
+        position = torch.arange(new_max_len, device=device, dtype=dtype).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, device=device, dtype=dtype) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(1, new_max_len, d_model, device=device, dtype=dtype)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.pe = pe
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """
+        Allow loading checkpoints whose positional encoding length differs
+        from the constructor default by resizing the buffer instead of erroring.
+        """
+        key = prefix + "pe"
+        if key in state_dict:
+            loaded_pe = state_dict[key]
+            if loaded_pe.dim() == 3 and loaded_pe.size(2) == self.pe.size(2):
+                self._extend_pe(
+                    loaded_pe.size(1),
+                    device=self.pe.device,
+                    dtype=self.pe.dtype,
+                )
+                state_dict[key] = loaded_pe.to(device=self.pe.device, dtype=self.pe.dtype)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def forward(self, x: torch.Tensor, x_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if x_pos is None:
-            x_pe = self.pe[:, : x.size(1)]
-        else:
-            x_pe = self.pe[0, x_pos]
-        x = x + x_pe
-        return x
+        needed_len = int(x.size(1)) if x_pos is None else int(torch.as_tensor(x_pos).max().item()) + 1
+        self._extend_pe(needed_len, device=x.device, dtype=x.dtype)
+
+        x_pe = self.pe[:, : x.size(1)] if x_pos is None else self.pe[0, x_pos]
+        return x + x_pe
 
 
 # ============================================================================

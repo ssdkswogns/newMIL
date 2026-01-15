@@ -2,7 +2,7 @@
 
 # 실행할 데이터셋 목록
 DATASETS=(
-  # "ArticularyWordRecognition"
+  "ArticularyWordRecognition"
   # # "AtrialFibrillation"
   # "BasicMotions"
   # "Cricket"
@@ -17,7 +17,7 @@ DATASETS=(
   # # "Heartbeat"
   # "Libras"
   # "LSST"
-  "MotorImagery"
+  # "MotorImagery"
   # "NATOPS"
   # "PenDigits"
   # "PEMS-SF"

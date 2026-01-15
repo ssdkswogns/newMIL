@@ -27,23 +27,15 @@ from aeon.datasets import load_classification
 from syntheticdataset import MixedSyntheticBagsConcatK
 from utils import *
 from mydataload import loadorean
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMILwithCL
+from models.AmbiguousMIL import AmbiguousMILwithCL
 from compute_aopcr import compute_classwise_aopcr
 from models.milet import MILLET
-from models.hybridmil import HybridMIL, ContextualMIL
-from models.hybridmil import HybridMIL, ContextualMIL
 
 warnings.filterwarnings("ignore")
 
 # ------------------------ Seed ------------------------
-seed = 42
-random.seed(seed)
-np.random.seed(seed)
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+# NOTE: Removed global seed initialization.
+# Seed is set later from args.seed to allow different random test sets per evaluation.
 
 
 def evaluate_classification(testloader, milnet, criterion, args, class_names, threshold: float = 0.5):
@@ -64,22 +56,13 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
 
             out = milnet(bag_feats)
             if args.model == 'AmbiguousMIL':
-                if not isinstance(out, (tuple, list)) or len(out) < 6:
+                if not isinstance(out, (tuple, list)) or len(out) < 4:
                     raise ValueError("Unexpected AmbiguousMIL output")
-                logits, instance_pred = out[0], out[1]
-                attn_layer2 = out[-1]
-            elif args.model in ['HybridMIL', 'ContextualMIL']:
-                if not isinstance(out, (tuple, list)) or len(out) < 4:
-                    raise ValueError("Unexpected Hybrid/ContextualMIL output")
                 bag_logits_ts, bag_logits_tp, weighted_logits, inst_logits = out[:4]
-                logits = bag_logits_tp if getattr(args, "hybrid_bag_head", "tp") != "ts" else bag_logits_ts
-                instance_pred = inst_logits
+                # tp head is main bag prediction; weighted logits are per-timestep
+                logits = bag_logits_tp
+                instance_pred = weighted_logits
                 attn_layer2 = None
-            elif args.model in ['TimeMIL', 'newTimeMIL']:
-                if not isinstance(out, (tuple, list)) or len(out) < 4:
-                    raise ValueError("Unexpected model output")
-                logits, _, _, attn_layer2 = out
-                instance_pred = None
             elif args.model == 'MILLET':
                 if not isinstance(out, (tuple, list)) or len(out) < 3:
                     raise ValueError("Unexpected MILLET output")
@@ -97,21 +80,14 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
             all_labels.append(label.cpu().numpy())
 
             _, _, C = y_inst.shape
-            if args.model in ['HybridMIL', 'ContextualMIL'] and instance_pred is not None:
-                pred_inst = torch.argmax(instance_pred, dim=2).cpu()
-            elif args.model == 'MILLET' and instance_pred is not None:
+            if args.model == 'MILLET' and instance_pred is not None:
                 # MILLET interpretation map is [B, C, T]; follow main_cl_fix behavior
                 pred_inst = torch.argmax(non_weighted_instance_pred, dim=2).cpu()
             else:
-                if attn_layer2 is None:
-                    raise ValueError("Attention output is required for instance prediction")
-                attn_cls = attn_layer2[:, :, :C, C:]
-                attn_mean = attn_cls.mean(dim=1)
-
                 if args.model == 'AmbiguousMIL' and instance_pred is not None:
                     pred_inst = torch.argmax(instance_pred, dim=2).cpu()
                 else:
-                    pred_inst = torch.argmax(attn_mean, dim=1).cpu()
+                    raise ValueError("Instance prediction not available for model")
 
             y_inst_label = torch.argmax(y_inst, dim=2).cpu()
 
@@ -226,21 +202,28 @@ def build_datasets(args):
     Xtr = torch.from_numpy(Xtr).permute(0, 2, 1).float()  # [N,T,D]
     Xte = torch.from_numpy(Xte).permute(0, 2, 1).float()
 
-    class_values = meta.get('class_values', None)
-    num_classes = len(class_values) if class_values is not None else len(np.unique(ytr))
+    class_order = getattr(args, "class_order", "unique")
+    if class_order == "meta" and meta.get("class_values", None) is not None:
+        class_values = meta["class_values"]
+    else:
+        # default: np.unique to mirror training (lexicographic ordering for string labels)
+        class_values = np.unique(ytr)
+    num_classes = len(class_values)
     args.num_classes = num_classes
 
-    if class_values is not None:
-        class_names = list(class_values)
-        word_to_idx = {cls: i for i, cls in enumerate(class_values)}
-        yte_idx = torch.tensor([word_to_idx[i] for i in yte], dtype=torch.long)
-    else:
-        class_names = [str(i) for i in range(num_classes)]
-        yte_idx = torch.tensor(yte, dtype=torch.long)
+    class_names = list(class_values)
+    word_to_idx = {cls: i for i, cls in enumerate(class_values)}
+    yte_idx = torch.tensor([word_to_idx[i] for i in yte], dtype=torch.long)
 
     L_in = Xtr.shape[-1]
     seq_len = max(21, Xte.shape[1])
     args.feats_size = L_in
+
+    # CRITICAL: Re-seed before dataset creation to ensure reproducibility
+    # (aeon's load_classification may consume random state)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     testset = MixedSyntheticBagsConcatK(
         X=Xte, y_idx=yte_idx, num_classes=num_classes,
@@ -255,40 +238,13 @@ def build_datasets(args):
 
 
 def build_model(args, seq_len, num_classes, device):
-    if args.model == 'TimeMIL':
-        milnet = TimeMIL(args.feats_size, mDim=args.embed,
-                         n_classes=num_classes,
-                         dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-                         max_seq_len=seq_len, is_instance=True).to(device)
-    elif args.model == 'newTimeMIL':
-        milnet = newTimeMIL(args.feats_size, mDim=args.embed,
-                            n_classes=num_classes,
-                            dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-                            max_seq_len=seq_len, is_instance=True).to(device)
-    elif args.model == 'AmbiguousMIL':
-        milnet = AmbiguousMILwithCL(args.feats_size, mDim=args.embed,
-                                    n_classes=num_classes,
-                                    dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-                         max_seq_len=seq_len, is_instance=True).to(device)
-    elif args.model == 'HybridMIL':
-        milnet = HybridMIL(
-            in_features=args.feats_size,
-            n_classes=num_classes,
-            mDim=args.embed,
-            dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-            is_instance=True
-        ).to(device)
-    elif args.model == 'ContextualMIL':
-        milnet = ContextualMIL(
+    if args.model == 'AmbiguousMIL':
+        milnet = AmbiguousMILwithCL(
             in_features=args.feats_size,
             n_classes=num_classes,
             mDim=args.embed,
             dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
             is_instance=True,
-            attn_layers=getattr(args, 'attn_layers', 1),
-            attn_heads=getattr(args, 'attn_heads', 4),
-            attn_dropout=getattr(args, 'attn_dropout', 0.1),
-            use_pos_enc=bool(getattr(args, 'use_pos_enc', True)),
         ).to(device)
     elif args.model == 'MILLET':
         milnet = MILLET(args.feats_size, mDim=args.embed,
@@ -310,9 +266,9 @@ def main():
     parser.add_argument('--feats_size', default=512, type=int, help='Dimension of the feature size')
     parser.add_argument('--gpu_index', type=int, nargs='+', default=(0,), help='GPU ID(s) [0]')
     parser.add_argument('--seed', default=42, type=int, help='random seed')
-    parser.add_argument('--model', default='newTimeMIL', type=str,
-                        help='MIL model: TimeMIL | newTimeMIL | AmbiguousMIL | HybridMIL | ContextualMIL | MILLET')
-    parser.add_argument('--model_path', default='./savemodel/InceptBackbone/BasicMotions/exp_7/weights/best_newTimeMIL.pth',
+    parser.add_argument('--model', default='AmbiguousMIL', type=str,
+                        help='MIL model: AmbiguousMIL | MILLET')
+    parser.add_argument('--model_path', default='./savemodel/InceptBackbone/BasicMotions/exp_7/weights/best_AmbiguousMIL.pth',
                         type=str, help='Target model path for evaluation')
     parser.add_argument('--embed', default=128, type=int, help='Number of embedding')
     parser.add_argument('--batchsize', default=64, type=int, help='batchsize')
@@ -330,12 +286,12 @@ def main():
     parser.add_argument('--dropout_node', default=0.0, type=float, help='Dropout rate for classifier heads')
     parser.add_argument('--millet_pooling', default="conjunctive", type=str,
                         help="MILLET pooling method: conjunctive | attention | instance | additive | gap")
-    parser.add_argument('--hybrid_bag_head', default='tp', choices=['tp', 'ts'],
-                        help='Hybrid/ContextualMIL bag head to use (tp=conjunctive, ts=attention)')
     parser.add_argument('--no_fallback_to_predicted', action='store_false', dest='fallback_to_predicted',
                         help='If set, skip bags with no positive labels instead of using argmax prediction')
     parser.add_argument('--cls_threshold', default=0.5, type=float, help='Threshold for multi-label classification metrics')
     parser.add_argument('--datatype', default="mixed", type=str, help='Choose datatype between original and mixed')
+    parser.add_argument('--class_order', default="unique", choices=["unique", "meta"],
+                        help='Class index order: "unique" (np.unique, matches training) or "meta" (meta.class_values order)')
 
     args = parser.parse_args()
     gpu_ids = tuple(args.gpu_index)
@@ -353,7 +309,7 @@ def main():
     testset, class_names, seq_len, num_classes, feat_dim = build_datasets(args)
     milnet = build_model(args, seq_len, num_classes, device)
 
-    # DataLoader
+    # DataLoader (classification)
     testloader = DataLoader(
         testset, batch_size=args.batchsize, shuffle=False,
         num_workers=args.num_workers, drop_last=False, pin_memory=True
@@ -373,11 +329,17 @@ def main():
     print("\nClassification metrics:", cls_results)
     print("Instance accuracy:", inst_acc)
 
+    # AOPCR (use batch_size=1 for perturbation stability)
+    testloader_aopcr = DataLoader(
+        testset, batch_size=1, shuffle=False,
+        num_workers=args.num_workers, drop_last=False, pin_memory=True
+    )
+
     # AOPCR
     print(f"Computing class-wise AOPCR (stop={args.aopcr_stop}, step={args.aopcr_step}) ...")
     result = compute_classwise_aopcr(
         milnet,
-        testloader,
+        testloader_aopcr,
         args,
         stop=args.aopcr_stop,
         step=args.aopcr_step,
