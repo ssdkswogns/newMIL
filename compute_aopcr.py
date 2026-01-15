@@ -203,8 +203,8 @@ def compute_classwise_aopcr(
                     # instance_logits: [B, T, C] (weighted logits)
                     scores = instance_logits[b, :, pred_c]              # [T]
                 elif args.model == 'MILLET' and interpretation is not None:
-                    # instance_logits: [B, T, C]
-                    scores = interpretation[b, :, pred_c]
+                    # interpretation: [B, C, T] (class-first)
+                    scores = interpretation[b, pred_c, :]
                 elif args.model in ['MLSTM_FCN', 'OS_CNN']:
                     if interpretation is None:
                         raise ValueError(f"{args.model} needs CAM interpretation for AOPCR")

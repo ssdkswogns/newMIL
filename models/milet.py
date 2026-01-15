@@ -32,14 +32,13 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
         self.pe: torch.Tensor
 
-    def _extend_pe(self, new_max_len: int, device: torch.device, dtype: torch.dtype) -> None:
+    def _resize_pe(self, new_max_len: int, device: torch.device, dtype: torch.dtype) -> None:
         """
-        Extend the sinusoidal table on the fly if we encounter sequences longer
-        than the precomputed buffer (e.g., synthetic bags concatenating multiple
-        sequences).
+        Regenerate the sinusoidal table to the requested length/device/dtype.
+        Used both for forward-time growth and for adapting to checkpoint shapes.
         """
         if (
-            new_max_len <= self.pe.size(1)
+            new_max_len == self.pe.size(1)
             and self.pe.device == device
             and self.pe.dtype == dtype
         ):
@@ -65,13 +64,14 @@ class PositionalEncoding(nn.Module):
     ):
         """
         Allow loading checkpoints whose positional encoding length differs
-        from the constructor default by resizing the buffer instead of erroring.
+        from the constructor default by resizing the buffer instead of erroring
+        (handles both longer and shorter checkpoints).
         """
         key = prefix + "pe"
         if key in state_dict:
             loaded_pe = state_dict[key]
             if loaded_pe.dim() == 3 and loaded_pe.size(2) == self.pe.size(2):
-                self._extend_pe(
+                self._resize_pe(
                     loaded_pe.size(1),
                     device=self.pe.device,
                     dtype=self.pe.dtype,
@@ -90,7 +90,7 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x: torch.Tensor, x_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
         needed_len = int(x.size(1)) if x_pos is None else int(torch.as_tensor(x_pos).max().item()) + 1
-        self._extend_pe(needed_len, device=x.device, dtype=x.dtype)
+        self._resize_pe(needed_len, device=x.device, dtype=x.dtype)
 
         x_pe = self.pe[:, : x.size(1)] if x_pos is None else self.pe[0, x_pos]
         return x + x_pe
