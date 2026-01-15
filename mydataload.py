@@ -152,18 +152,18 @@ class loadorean(Dataset):
 
         if split == 'train':
             if args.dataset == 'InsectWingbeat':
-                Xtr, ytr, meta = load_classification(name='InsectWingbeat', split='train', extract_path='../timeclass/dataset/')
+                Xtr, ytr, meta = load_classification(name='InsectWingbeat', split='train', extract_path='../timeclass/dataset/', return_metadata=True)
             else:
-                Xtr, ytr, meta = load_classification(name=args.dataset, split='train')
+                Xtr, ytr, meta = load_classification(name=args.dataset, split='train', return_metadata=True)
             word_to_idx = {meta['class_values'][i]: i for i in range(len(meta['class_values']))}
             ytr = [word_to_idx[i] for i in ytr]
             self.label = F.one_hot(torch.tensor(ytr)).float()
             self.FeatList = Xtr
         elif split == 'test':
             if args.dataset == 'InsectWingbeat':
-                Xte, yte, meta = load_classification(name='InsectWingbeat', split='test', extract_path='../timeclass/dataset/')
+                Xte, yte, meta = load_classification(name='InsectWingbeat', split='test', extract_path='../timeclass/dataset/', return_metadata=True)
             else:
-                Xte, yte, meta = load_classification(name=args.dataset, split='test')
+                Xte, yte, meta = load_classification(name=args.dataset, split='test', return_metadata=True)
             word_to_idx = {meta['class_values'][i]: i for i in range(len(meta['class_values']))}
             yte = [word_to_idx[i] for i in yte]
             self.label = F.one_hot(torch.tensor(yte)).float()

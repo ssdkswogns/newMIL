@@ -5,7 +5,7 @@ ROOT="./savemodel/millet_mixed_data"
 # 다시 돌리고 싶은 데이터셋만 지정하면 아래 리스트를 사용.
 # 비워두면 ROOT 아래 모든 폴더를 자동 수집.
 RETRY_DATASETS=(
-  "ArticularyWordRecognition"
+  "JapaneseVowels"
 )
 
 # dataset 리스트 결정

@@ -9,6 +9,7 @@ DATASETS=(
   # "DuckDuckGeese"
   # "Epilepsy"
   # "EthanolConcentration"
+  "EigenWorms"
   # "ERing"
   # "FaceDetection"
   # "FingerMovements"
@@ -17,7 +18,7 @@ DATASETS=(
   # # "Heartbeat"
   # "Libras"
   # "LSST"
-  "MotorImagery"
+  # "MotorImagery"
   # "NATOPS"
   # "PenDigits"
   # "PEMS-SF"
@@ -33,5 +34,5 @@ DATASETS=(
 # 반복 실행
 for dataset in "${DATASETS[@]}"; do
     echo "Running TimeMIL on dataset: $dataset"
-    python main_cl_fix_ambiguous.py  --dataset "$dataset" --model MILLET  --millet_pooling conjunctive   --embed 128  --dropout_node 0.1  --dropout_patch 0  --num_epochs 1500  --lr 5e-3 --datatype original
+    python main_cl_fix_ambiguous.py  --dataset "$dataset" --model MILLET  --millet_pooling conjunctive   --embed 128  --dropout_node 0.1  --dropout_patch 0  --num_epochs 1500  --lr 5e-3 --datatype mixed
 done

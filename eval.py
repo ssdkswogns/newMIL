@@ -48,9 +48,22 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
     per_class_total = None
     total_correct = 0
     total_count = 0
+    has_inst_labels = False
 
     with torch.no_grad():
-        for batch_id, (feats, label, y_inst) in enumerate(testloader):
+        for batch_id, batch in enumerate(testloader):
+            # Accept both (feats, label) and (feats, label, y_inst) batches.
+            y_inst = None
+            if isinstance(batch, (list, tuple)):
+                if len(batch) == 3:
+                    feats, label, y_inst = batch
+                elif len(batch) == 2:
+                    feats, label = batch
+                else:
+                    raise ValueError(f"Unexpected batch length {len(batch)} in testloader.")
+            else:
+                raise ValueError(f"Unexpected batch type {type(batch)} in testloader.")
+
             bag_feats = feats.to(next(milnet.parameters()).device)
             bag_label = label.to(next(milnet.parameters()).device)
 
@@ -79,35 +92,38 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
             all_probs.append(probs)
             all_labels.append(label.cpu().numpy())
 
-            _, _, C = y_inst.shape
-            if args.model == 'MILLET' and instance_pred is not None:
-                # MILLET interpretation map is [B, C, T]; follow main_cl_fix behavior
-                pred_inst = torch.argmax(non_weighted_instance_pred, dim=2).cpu()
-            else:
-                if args.model == 'AmbiguousMIL' and instance_pred is not None:
-                    pred_inst = torch.argmax(instance_pred, dim=2).cpu()
+            # Instance accuracy is only available when y_inst is provided.
+            if y_inst is not None:
+                has_inst_labels = True
+                _, _, C = y_inst.shape
+                if args.model == 'MILLET' and instance_pred is not None:
+                    # MILLET interpretation map is [B, C, T]; follow main_cl_fix behavior
+                    pred_inst = torch.argmax(non_weighted_instance_pred, dim=2).cpu()
                 else:
-                    raise ValueError("Instance prediction not available for model")
+                    if args.model == 'AmbiguousMIL' and instance_pred is not None:
+                        pred_inst = torch.argmax(instance_pred, dim=2).cpu()
+                    else:
+                        raise ValueError("Instance prediction not available for model")
 
-            y_inst_label = torch.argmax(y_inst, dim=2).cpu()
+                y_inst_label = torch.argmax(y_inst, dim=2).cpu()
 
-            correct = (pred_inst == y_inst_label).sum().item()
-            count = pred_inst.numel()
+                correct = (pred_inst == y_inst_label).sum().item()
+                count = pred_inst.numel()
 
-            total_correct += correct
-            total_count += count
+                total_correct += correct
+                total_count += count
 
-            if per_class_correct is None:
-                per_class_correct = torch.zeros(C, dtype=torch.long)
-                per_class_total = torch.zeros(C, dtype=torch.long)
+                if per_class_correct is None:
+                    per_class_correct = torch.zeros(C, dtype=torch.long)
+                    per_class_total = torch.zeros(C, dtype=torch.long)
 
-            pb = pred_inst.view(-1)
-            tb = y_inst_label.view(-1)
-            for c_id in range(C):
-                mask = (tb == c_id)
-                if mask.any():
-                    per_class_correct[c_id] += (pb[mask] == tb[mask]).sum().cpu()
-                    per_class_total[c_id] += mask.sum().cpu()
+                pb = pred_inst.view(-1)
+                tb = y_inst_label.view(-1)
+                for c_id in range(C):
+                    mask = (tb == c_id)
+                    if mask.any():
+                        per_class_correct[c_id] += (pb[mask] == tb[mask]).sum().cpu()
+                        per_class_total[c_id] += mask.sum().cpu()
 
             sys.stdout.write('\r Testing bag [%d/%d] bag loss: %.4f'
                              % (batch_id, len(testloader), loss.item()))
@@ -134,19 +150,21 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
     roc_macro = float(np.mean(roc_list)) if roc_list else 0.0
     ap_macro = float(np.mean(ap_list)) if ap_list else 0.0
 
-    timestep_acc = float(total_correct / total_count) if total_count > 0 else 0.0
-    per_class_acc = []
-    for c_id in range(per_class_total.numel()):
-        tot = int(per_class_total[c_id].item())
-        cor = int(per_class_correct[c_id].item())
-        acc = float(cor / tot) if tot > 0 else 0.0
-        label = class_names[c_id] if (class_names is not None and c_id < len(class_names)) else f"class-{c_id}"
-        per_class_acc.append({"class_id": c_id, "label": label, "count": tot, "correct": cor, "acc": acc})
+    inst_acc = None
+    if has_inst_labels and per_class_correct is not None and per_class_total is not None:
+        timestep_acc = float(total_correct / total_count) if total_count > 0 else 0.0
+        per_class_acc = []
+        for c_id in range(per_class_total.numel()):
+            tot = int(per_class_total[c_id].item())
+            cor = int(per_class_correct[c_id].item())
+            acc = float(cor / tot) if tot > 0 else 0.0
+            label = class_names[c_id] if (class_names is not None and c_id < len(class_names)) else f"class-{c_id}"
+            per_class_acc.append({"class_id": c_id, "label": label, "count": tot, "correct": cor, "acc": acc})
 
-    inst_acc = {
-        "timestep_accuracy_overall": timestep_acc,
-        "per_class": per_class_acc
-    }
+        inst_acc = {
+            "timestep_accuracy_overall": timestep_acc,
+            "per_class": per_class_acc
+        }
 
     results: Dict[str, float] = {
         "f1_micro": f1_micro, "f1_macro": f1_macro,

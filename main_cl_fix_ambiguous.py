@@ -441,11 +441,20 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
 
     with torch.no_grad():
         for batch_id, batch in enumerate(testloader):
-
-            if args.datatype == "mixed":
-                feats, label, y_inst = batch
+            # Support both (feats, label) and (feats, label, y_inst) batches.
+            y_inst = None
+            if isinstance(batch, (list, tuple)):
+                if len(batch) == 3:
+                    feats, label, y_inst = batch
+                elif len(batch) == 2:
+                    feats, label = batch
+                else:
+                    raise ValueError(f"Unexpected batch length {len(batch)} in testloader.")
             else:
-                feats, label = batch
+                raise ValueError(f"Unexpected batch type {type(batch)} in testloader.")
+
+            # Instance labels are only used for mixed datatype; ignore otherwise.
+            if args.datatype != "mixed":
                 y_inst = None
             
             bag_feats = feats.to(device)
@@ -766,6 +775,7 @@ def main():
         testset = loadorean(args, split='test')
 
         seq_len,num_classes,L_in=trainset.max_len,trainset.num_class,trainset.feat_in
+        args.seq_len = seq_len
 
         if is_main:
             print(f'max length {seq_len}')
