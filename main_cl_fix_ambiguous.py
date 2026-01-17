@@ -45,6 +45,10 @@ from compute_aopcr import compute_classwise_aopcr
 
 from os.path import join
 
+from dba_dataloader import (
+    build_dba_for_timemil,
+    build_dba_windows_for_mixed,
+)
 # Suppress all warnings
 warnings.filterwarnings("ignore")
 
@@ -677,6 +681,12 @@ def main():
     parser.add_argument('--dtw_window', type=int, default=None, help='Sakoe-Chiba window for DTW baselines (None = full)')
     parser.add_argument('--dtw_max_train', type=int, default=None, help='Limit DTW baselines to first N train samples')
     parser.add_argument('--dtw_max_test', type=int, default=None, help='Limit DTW baselines to first N test samples')
+    # DBA dataset knobs
+    parser.add_argument('--dba_root', type=str, default='/home/moon/code/newMIL/data/dba_parser', help='DBA root dir containing <driver>/<style>/parsed_50hz.csv')
+    parser.add_argument('--dba_window', type=int, default=12000, help='Sliding window size for DBA windows')
+    parser.add_argument('--dba_stride', type=int, default=6000, help='Sliding window stride for DBA windows')
+    parser.add_argument('--dba_test_ratio', type=float, default=0.2, help='Driver-level test split ratio for DBA')
+    parser.add_argument('--dba_concat_k', type=int, default=2, help='Number of windows to concatenate when building mixed DBA bags')
 
     parser.add_argument('--save_dir', default='./savemodel/', type=str, help='the directory used to save all the output')
     parser.add_argument('--epoch_des', default=20, type=int, help='turn on warmup')
@@ -758,6 +768,7 @@ def main():
 
     # loss weight 설정 (이미 parser에서 주입됨)
 
+    dataset_name = args.dataset.lower()
     if is_main:
         option = vars(args)
         file_name = os.path.join(args.save_dir, 'option.txt')
@@ -770,7 +781,36 @@ def main():
     criterion = nn.BCEWithLogitsLoss()
 
     # ---------------- 데이터 구성 ----------------
-    if args.dataset in ['JapaneseVowels','SpokenArabicDigits','CharacterTrajectories','InsectWingbeat']:
+    if dataset_name == 'dba':
+        if args.datatype == 'mixed':
+            Xtr, ytr_idx, Xte, yte_idx, seq_len, num_classes, feat_in = build_dba_windows_for_mixed(args)
+            trainset = MixedSyntheticBagsConcatK(
+                X=Xtr,
+                y_idx=ytr_idx,
+                num_classes=num_classes,
+                total_bags=len(Xtr),
+                concat_k=args.dba_concat_k,
+                seed=args.seed,
+            )
+            testset = MixedSyntheticBagsConcatK(
+                X=Xte,
+                y_idx=yte_idx,
+                num_classes=num_classes,
+                total_bags=len(Xte),
+                concat_k=args.dba_concat_k,
+                seed=args.seed + 1,
+                return_instance_labels=True,
+            )
+        else:
+            trainset, testset, seq_len, num_classes, feat_in = build_dba_for_timemil(args)
+
+        args.seq_len = seq_len
+        args.feats_size = feat_in
+        args.num_classes = num_classes
+        if is_main:
+            print(f'[DBA] seq len {args.seq_len}, feat {args.feats_size}, classes {args.num_classes}')
+
+    elif args.dataset in ['JapaneseVowels','SpokenArabicDigits','CharacterTrajectories','InsectWingbeat']:
         trainset = loadorean(args, split='train')
         testset = loadorean(args, split='test')
 
