@@ -38,5 +38,6 @@ DATASETS=(
 
 for dataset in "${DATASETS[@]}"; do
     echo "Running TimeMIL on dataset: $dataset"
-    torchrun --nproc_per_node=2 main_cl_fix.py --dataset $dataset --model newTimeMIL --datatype mixed
+    # torchrun --nproc_per_node=2 main_cl_fix.py --dataset $dataset --model newTimeMIL --datatype mixed
+    CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 --master_port=29600 main_cl_exp.py --dataset $dataset --model newTimeMIL --datatype mixed --num_epochs 1500
 done

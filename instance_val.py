@@ -33,7 +33,7 @@ import random
 from lookhead import Lookahead
 import warnings
 
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL
+from models.timemil_old import TimeMIL, newTimeMIL, AmbiguousMIL
 
 # Suppress all warnings
 warnings.filterwarnings("ignore")

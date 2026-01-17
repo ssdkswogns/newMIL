@@ -36,7 +36,7 @@ import wandb
 from lookhead import Lookahead
 import warnings
 
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
+from models.timemil_old import TimeMIL, newTimeMIL, AmbiguousMIL, AmbiguousMILwithCL
 from compute_aopcr import compute_classwise_aopcr
 
 from os.path import join

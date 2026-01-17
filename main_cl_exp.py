@@ -27,6 +27,7 @@ from utils import *
 from torch.cuda.amp import GradScaler, autocast
 import torch.nn.functional as F
 from mydataload import loadorean
+from dba_dataloader import build_dba_for_timemil, build_dba_windows_for_mixed
 import random
 
 import wandb
@@ -35,7 +36,8 @@ import wandb
 from lookhead import Lookahead
 import warnings
 
-from models.timemil import TimeMIL, newTimeMIL, AmbiguousMIL
+from models.timemil_old import newTimeMIL, AmbiguousMIL
+from models.timemil import TimeMIL
 from models.expmil import AmbiguousMILwithCL
 from compute_aopcr import compute_classwise_aopcr
 
@@ -424,10 +426,10 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             )
         else:
             if epoch < args.epoch_des:
-                bag_prediction = milnet(bag_feats, warmup=True)
+                bag_prediction, x_cls, attn_layer1, attn_layer2 = milnet(bag_feats, warmup=True)
                 instance_pred = None
             else:
-                bag_prediction = milnet(bag_feats, warmup=False)
+                bag_prediction, x_cls, attn_layer1, attn_layer2 = milnet(bag_feats, warmup=False)
                 instance_pred = None
 
         # bag-level loss
@@ -605,7 +607,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
             inst_loss = 0.0
             # ortho_loss = torch.tensor(0.0, device=device)
             # smooth_loss = torch.tensor(0.0, device=device)
-            # sparsity_loss = torch.tensor(0.0, device=device)
+            sparsity_loss = torch.tensor(0.0, device=device)
             proto_inst_loss = torch.tensor(0.0, device=device)
             # cls_contrast_loss = torch.tensor(0.0, device=device)
 
@@ -657,29 +659,29 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                         win=getattr(args, "proto_win", 5),
                     )
 
-                if args.datatype == "mixed" and (y_inst is not None):
-                    # y_inst: [B, T, C] one-hot instance labels
-                    # CPU에 있어도 되지만, 일단 계산 편의를 위해 device로 올림
-                    y_inst = y_inst.to(device)
-                    # timestep별 정답 클래스 인덱스
-                    y_inst_label = torch.argmax(y_inst, dim=2)  # [B, T]
+            if args.datatype == "mixed" and (y_inst is not None):
+                # y_inst: [B, T, C] one-hot instance labels
+                # CPU에 있어도 되지만, 일단 계산 편의를 위해 device로 올림
+                y_inst = y_inst.to(device)
+                # timestep별 정답 클래스 인덱스
+                y_inst_label = torch.argmax(y_inst, dim=2)  # [B, T]
 
-                    # AmbiguousMIL인 경우 instance_pred에서 직접 argmax
-                    if args.model == 'AmbiguousMIL':
-                        pred_inst = torch.argmax(weighted_instance_pred, dim=2)  # [B, T]
-                    elif args.model == 'newTimeMIL' and attn_layer2 is not None:
-                        B, T, C = y_inst.shape
-                        attn_cls = attn_layer2[:,:,:C,C:]
-                        attn_mean = attn_cls.mean(dim=1)
-                        pred_inst = torch.argmax(attn_mean, dim=1).cpu()
-                    else:
-                        pred_inst = None
+                # AmbiguousMIL인 경우 instance_pred에서 직접 argmax
+                if args.model == 'AmbiguousMIL':
+                    pred_inst = torch.argmax(weighted_instance_pred, dim=2)  # [B, T]
+                elif args.model == 'newTimeMIL' and attn_layer2 is not None:
+                    B, T, C = y_inst.shape
+                    attn_cls = attn_layer2[:,:,:C,C:]
+                    attn_mean = attn_cls.mean(dim=1)
+                    pred_inst = torch.argmax(attn_mean, dim=1)
+                else:
+                    pred_inst = None
 
-                    if pred_inst is not None:
-                        correct = (pred_inst == y_inst_label).sum().item()
-                        count   = y_inst_label.numel()
-                        inst_total_correct += correct
-                        inst_total_count   += count
+                if pred_inst is not None:
+                    correct = (pred_inst == y_inst_label).sum().item()
+                    count   = y_inst_label.numel()
+                    inst_total_correct += correct
+                    inst_total_count   += count
 
             if args.model == 'AmbiguousMIL':
                 loss = (
@@ -831,6 +833,12 @@ def main():
     parser.add_argument('--proto_loss_w', type=float, default=0.2, help='weight for prototype instance contrastive loss')
     parser.add_argument('--cls_contrast_tau', type=float, default=0.1, help='temperature for batch class embedding contrastive loss')
     parser.add_argument('--cls_contrast_w', type=float, default=0.0, help='weight for batch class embedding contrastive loss')
+    
+    parser.add_argument('--dba_root', type=str, default='./data/dba_data', help='Root directory of DBA dataset (1_xxx/aggressive/... 구조)')
+    parser.add_argument('--dba_window', type=int, default=12000, help='Sliding window length (time steps) for DBA dataset')
+    parser.add_argument('--dba_stride', type=int, default=6000, help='Sliding window stride for DBA dataset')
+    parser.add_argument('--dba_test_ratio', type=float, default=0.2, help='Train/Test split ratio (sequence-level) for DBA dataset')
+
     args = parser.parse_args()
 
     # ----- DDP setup -----
@@ -918,6 +926,46 @@ def main():
         args.num_classes = num_classes
         if is_main:
             print(f'num class:{args.num_classes}')
+    elif args.dataset == 'dba':
+        if is_main:
+            print(f"[DBA] building dataset from root: {args.dba_root}")
+
+        if args.datatype == 'original':
+            # window 하나가 bag이 되는 기존 방식
+            trainset, testset, seq_len, num_classes, L_in = build_dba_for_timemil(args)
+
+        elif args.datatype == 'mixed':
+            # window 단위로 잘라서 concat-bag 을 만드는 방식
+            Xtr, ytr_idx, Xte, yte_idx, seq_len, num_classes, L_in = build_dba_windows_for_mixed(args)
+
+            trainset = MixedSyntheticBagsConcatK(
+                X=Xtr,
+                y_idx=ytr_idx,
+                num_classes=num_classes,
+                total_bags=len(Xtr),
+                concat_k=2,
+                seed=args.seed,
+            )
+            testset = MixedSyntheticBagsConcatK(
+                X=Xte,
+                y_idx=yte_idx,
+                num_classes=num_classes,
+                total_bags=len(Xte),
+                concat_k=2,
+                seed=args.seed+1,
+                return_instance_labels=True,
+            )
+        else:
+            raise ValueError(f"Unsupported datatype '{args.datatype}' for DBA dataset")
+
+        args.seq_len = seq_len
+        args.feats_size = L_in
+        args.num_classes = num_classes
+
+        if is_main:
+            print(f"[DBA] seq_len (window): {seq_len}")
+            print(f"[DBA] num_classes: {num_classes}")
+            print(f"[DBA] feat_in: {L_in}")
     else:
         Xtr, ytr, meta = load_classification(name=args.dataset, split='train',extract_path='./data')
         Xte, yte, _   = load_classification(name=args.dataset, split='test',extract_path='./data')
@@ -966,7 +1014,7 @@ def main():
         base_model = TimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len).to(device)
         proto_bank = None
     elif args.model == 'newTimeMIL':
-        base_model = newTimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len).to(device)
+        base_model = TimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len, is_instance=True).to(device)
         proto_bank = None
     elif args.model == 'AmbiguousMIL':
         base_model = AmbiguousMILwithCL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, is_instance=True).to(device)
@@ -1231,7 +1279,7 @@ def main():
             eval_model = TimeMIL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
                                  dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
         elif args.model == 'newTimeMIL':
-            eval_model = newTimeMIL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
+            eval_model = TimeMIL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
                                     dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
         elif args.model == 'AmbiguousMIL':
             eval_model = AmbiguousMILwithCL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,

@@ -27,7 +27,7 @@ from aeon.datasets import load_classification
 from syntheticdataset import MixedSyntheticBagsConcatK
 from utils import *
 from mydataload import loadorean
-from models.timemil import TimeMIL, newTimeMIL
+from models.timemil_old import TimeMIL, newTimeMIL
 from models.expmil import AmbiguousMILwithCL
 from compute_aopcr import compute_classwise_aopcr
 

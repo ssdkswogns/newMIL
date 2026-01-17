@@ -39,7 +39,7 @@ from timm.optim.adamp import AdamP
 from lookhead import Lookahead
 import warnings
 
-from models.timemil import TimeMIL, newTimeMIL
+from models.timemil_old import TimeMIL, newTimeMIL
 
 # Suppress all warnings
 warnings.filterwarnings("ignore")

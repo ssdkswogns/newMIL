@@ -29,7 +29,7 @@ from aeon.datasets import load_classification
 from syntheticdataset import MixedSyntheticBagsConcatK
 from mydataload import loadorean
 
-from models.timemil import TimeMIL, newTimeMIL
+from models.timemil_old import TimeMIL, newTimeMIL
 from models.expmil import AmbiguousMILwithCL
 
 
@@ -138,65 +138,129 @@ def build_model(args, in_dim, num_classes, seq_len, device):
 # 그림 저장: GT band / Pred band / (옵션) attn heatmap
 # -------------------------------
 def save_gt_pred_plot(
-    y_inst_onehot: torch.Tensor,         # [T, C]
-    pred_inst: torch.Tensor,             # [T] (class id)
-    save_path: str,
-    class_names=None,
-    title: str = "",
-    attn_ct: torch.Tensor = None         # [C_attn, T] optional
-):
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        x_seq: torch.Tensor,               # [T, D]  <-- 추가
+        y_inst_onehot: torch.Tensor,       # [T, C]
+        pred_inst: torch.Tensor,           # [T]
+        save_path: str,
+        class_names=None,
+        title: str = "",
+        attn_ct: torch.Tensor = None,      # [C_attn, T] optional
+        feat_names=None,                  # optional: 길이 D의 리스트
+        plot_k: int = 6,
+        plot_idx=None,                    # optional: feature index list
+        plot_norm: str = "z",             # none|z|minmax
+        plot_offset: float = 2.5,
+        plot_alpha: float = 0.9,
+    ):
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    y_gt = torch.argmax(y_inst_onehot, dim=-1).detach().cpu().numpy()  # [T]
-    pred = pred_inst.detach().cpu().numpy()  # [T]
-    T = y_gt.shape[0]
-    C = y_inst_onehot.shape[1]
+        # --- numpy로 변환 ---
+        x_np = x_seq.detach().cpu().numpy()          # [T,D]
+        y_gt = torch.argmax(y_inst_onehot, dim=-1).detach().cpu().numpy()  # [T]
+        pred = pred_inst.detach().cpu().numpy()      # [T]
+        T = y_gt.shape[0]
+        C = y_inst_onehot.shape[1]
+        D = x_np.shape[1]
 
-    cmap_fixed = plt.get_cmap('tab20', C)
-    norm_fixed = mcolors.Normalize(vmin=-0.5, vmax=C - 0.5)
+        # --- 어떤 feature를 그릴지 선택 ---
+        if plot_idx is not None and len(plot_idx) > 0:
+            sel = [i for i in plot_idx if 0 <= i < D]
+            if len(sel) == 0:
+                sel = list(range(min(D, plot_k))) if plot_k > 0 else list(range(D))
+        else:
+            if plot_k == 0 or plot_k >= D:
+                sel = list(range(D))
+            else:
+                # 분산 큰 순서대로 상위 K개 선택 (정성 시각화에 보통 유용)
+                v = np.var(x_np, axis=0)
+                sel = np.argsort(-v)[:plot_k].tolist()
 
-    use_attn = attn_ct is not None
-    rows = 3 if use_attn else 2
-    fig_w = max(10.0, 0.05 * T + 8.0)
-    fig_h = 7.0 if use_attn else 5.0
+        x_sel = x_np[:, sel]  # [T,K]
+        K = x_sel.shape[1]
 
-    plt.figure(figsize=(fig_w, fig_h), dpi=150)
+        # --- 정규화 ---
+        if plot_norm == "z":
+            mu = x_sel.mean(axis=0, keepdims=True)
+            sd = x_sel.std(axis=0, keepdims=True) + 1e-9
+            x_sel = (x_sel - mu) / sd
+        elif plot_norm == "minmax":
+            mn = x_sel.min(axis=0, keepdims=True)
+            mx = x_sel.max(axis=0, keepdims=True)
+            x_sel = (x_sel - mn) / (mx - mn + 1e-9)
+        elif plot_norm == "none":
+            pass
+        else:
+            raise ValueError(f"Unknown plot_norm={plot_norm}")
 
-    # (1) GT
-    ax1 = plt.subplot(rows, 1, 1)
-    im1 = ax1.imshow(y_gt[None, :], aspect="auto", interpolation="nearest", cmap=cmap_fixed, norm=norm_fixed)
-    ax1.set_yticks([]); ax1.set_xticks([])
-    ax1.set_title(f"GT inst label (argmax)   {title}".strip())
-    cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.03, pad=0.02)
-    cbar1.set_label("class id")
-    if class_names and len(class_names) <= 20:
-        cbar1.set_ticks(np.arange(C))
-        cbar1.set_ticklabels(class_names)
+        # --- 밴드 컬러맵 ---
+        cmap_fixed = plt.get_cmap('tab20', C)
+        norm_fixed = mcolors.Normalize(vmin=-0.5, vmax=C - 0.5)
 
-    # (2) Pred
-    ax2 = plt.subplot(rows, 1, 2, sharex=ax1)
-    im2 = ax2.imshow(pred[None, :], aspect="auto", interpolation="nearest", cmap=cmap_fixed, norm=norm_fixed)
-    ax2.set_yticks([]); ax2.set_xticks([])
-    ax2.set_title("Pred inst (per-time class id)")
-    cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.03, pad=0.02)
-    cbar2.set_label("class id")
+        use_attn = attn_ct is not None
+        rows = 4 if use_attn else 3
 
-    # (3) Attn heatmap (optional)
-    if use_attn:
-        attn_np = attn_ct.detach().cpu().numpy() if isinstance(attn_ct, torch.Tensor) else np.asarray(attn_ct)
-        ax3 = plt.subplot(rows, 1, 3)
-        im3 = ax3.imshow(attn_np, aspect="auto", interpolation="nearest", cmap="viridis")
-        ax3.set_title(f"Attention (class->time)  shape=({attn_np.shape[0]}x{attn_np.shape[1]})")
-        ax3.set_xlabel("Time")
-        ax3.set_ylabel("Class token")
-        step = max(1, T // 20)
-        ax3.set_xticks(np.arange(0, T, step))
-        plt.colorbar(im3, ax=ax3, fraction=0.03, pad=0.02)
+        fig_w = max(12.0, 0.05 * T + 9.0)
+        fig_h = 10.0 if use_attn else 8.0
+        plt.figure(figsize=(fig_w, fig_h), dpi=150)
 
-    plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close()
-    print("[Saved]", save_path)
+        # (1) Input sequence plot
+        ax0 = plt.subplot(rows, 1, 1)
+        t = np.arange(T)
+
+        # offset stacked plot
+        for j in range(K):
+            y = x_sel[:, j] + j * plot_offset
+            ax0.plot(t, y, linewidth=1.0, alpha=plot_alpha)
+
+        ax0.set_title(f"Input sequence  (showing {K}/{D} features)   {title}".strip())
+        ax0.set_xlim(0, T - 1)
+        ax0.set_yticks([j * plot_offset for j in range(K)])
+
+        # ytick label: feature index or name
+        if feat_names is not None and len(feat_names) == D:
+            ylabels = [feat_names[i] for i in sel]
+        else:
+            ylabels = [f"f{idx}" for idx in sel]
+        ax0.set_yticklabels(ylabels)
+
+        ax0.set_xlabel("Time")
+        ax0.grid(True, axis="x", linewidth=0.3, alpha=0.4)
+
+        # (2) GT band
+        ax1 = plt.subplot(rows, 1, 2, sharex=ax0)
+        im1 = ax1.imshow(y_gt[None, :], aspect="auto", interpolation="nearest", cmap=cmap_fixed, norm=norm_fixed)
+        ax1.set_yticks([]); ax1.set_xticks([])
+        ax1.set_title("GT inst label (argmax)")
+        cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.03, pad=0.02)
+        cbar1.set_label("class id")
+        if class_names and len(class_names) <= 20:
+            cbar1.set_ticks(np.arange(C))
+            cbar1.set_ticklabels(class_names)
+
+        # (3) Pred band
+        ax2 = plt.subplot(rows, 1, 3, sharex=ax0)
+        im2 = ax2.imshow(pred[None, :], aspect="auto", interpolation="nearest", cmap=cmap_fixed, norm=norm_fixed)
+        ax2.set_yticks([]); ax2.set_xticks([])
+        ax2.set_title("Pred inst (per-time class id)")
+        cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.03, pad=0.02)
+        cbar2.set_label("class id")
+
+        # (4) Attn heatmap
+        if use_attn:
+            attn_np = attn_ct.detach().cpu().numpy() if isinstance(attn_ct, torch.Tensor) else np.asarray(attn_ct)
+            ax3 = plt.subplot(rows, 1, 4, sharex=ax0)
+            im3 = ax3.imshow(attn_np, aspect="auto", interpolation="nearest", cmap="viridis")
+            ax3.set_title(f"Attention (class->time)  shape=({attn_np.shape[0]}x{attn_np.shape[1]})")
+            ax3.set_xlabel("Time")
+            ax3.set_ylabel("Class token")
+            step = max(1, T // 20)
+            ax3.set_xticks(np.arange(0, T, step))
+            plt.colorbar(im3, ax=ax3, fraction=0.03, pad=0.02)
+
+        plt.tight_layout()
+        plt.savefig(save_path, bbox_inches="tight")
+        plt.close()
+        print("[Saved]", save_path)
 
 
 # -------------------------------
@@ -281,7 +345,27 @@ def main():
     parser.add_argument('--prepared_npz', type=str, default='./data/PAMAP2.npz')
 
     parser.add_argument('--max_save', default=200, type=int, help='최대 저장 샘플 수 (전체 저장 방지)')
+    parser.add_argument('--plot_k', default=0, type=int,
+                    help='input feature 중 상위 K개만 시각화 (0이면 모두)')
+    parser.add_argument('--plot_idx', default=None, type=str,
+                        help='특정 feature index만 시각화. 예: "0,2,5" (지정 시 plot_k 무시)')
+    parser.add_argument('--plot_norm', default='none', type=str, choices=['none', 'z', 'minmax'],
+                        help='input feature 정규화 방식')
+    parser.add_argument('--plot_offset', default=2.5, type=float,
+                        help='멀티채널을 한 축에 겹쳐 그릴 때 채널 간 vertical offset')
+    parser.add_argument('--plot_alpha', default=0.9, type=float,
+                        help='input plot 선 투명도')
     args = parser.parse_args()
+
+    def parse_plot_idx(s):
+        if s is None:
+            return None
+        s = s.strip()
+        if not s:
+            return None
+        return [int(x) for x in s.split(',')]
+
+    args.plot_idx = parse_plot_idx(args.plot_idx)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -328,23 +412,31 @@ def main():
                 if saved >= args.max_save:
                     print(f"[Done] Reached max_save={args.max_save}")
                     return
+                save_path = os.path.join(out_dir, f"idx{global_idx:05d}_gt_vs_pred.png")
+                title = f"{args.dataset} | {args.model} | idx={global_idx}"
 
+                xi = x[i].detach()             # [T,D]
                 yi = y_inst[i]                 # [T,C]
                 pi = pred_inst_b[i]            # [T]
                 attn_i = attn_ct_b[i] if attn_ct_b is not None else None
 
-                save_path = os.path.join(out_dir, f"idx{global_idx:05d}_gt_vs_pred.png")
-                title = f"{args.dataset} | {args.model} | idx={global_idx}"
                 save_gt_pred_plot(
+                    x_seq=xi,
                     y_inst_onehot=yi,
                     pred_inst=pi,
                     save_path=save_path,
                     class_names=class_names,
                     title=title,
-                    attn_ct=attn_i
+                    attn_ct=attn_i,
+                    feat_names=None,                 # 필요하면 여기에 feature name list
+                    plot_k=args.plot_k,
+                    plot_idx=args.plot_idx,
+                    plot_norm=args.plot_norm,
+                    plot_offset=args.plot_offset,
+                    plot_alpha=args.plot_alpha,
                 )
-                global_idx += 1
                 saved += 1
+                global_idx += 1
 
 
 if __name__ == "__main__":
