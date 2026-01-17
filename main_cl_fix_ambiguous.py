@@ -544,12 +544,17 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                     y_inst = y_inst.to(device)
                     y_inst_label = torch.argmax(y_inst, dim=2)  # [B, T]
 
+                    pred_inst = None
                     if args.model == 'AmbiguousMIL' and weighted_instance_pred is not None:
                         pred_inst = torch.argmax(weighted_instance_pred, dim=2)  # [B, T]
+                    elif args.model == 'MILLET' and instance_pred is not None:
+                        pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
+
+                    if pred_inst is not None:
                         correct = (pred_inst == y_inst_label).sum().item()
-                        count   = y_inst_label.numel()
+                        count = y_inst_label.numel()
                         inst_total_correct += correct
-                        inst_total_count   += count
+                        inst_total_count += count
 
             if args.model == 'AmbiguousMIL':
                 loss = (
