@@ -118,12 +118,16 @@ def compute_classwise_aopcr(
 
     for batch in testloader:
         # testloader: (feats, label, y_inst) 구조라고 가정 (지금 코드랑 동일)
-        if len(batch) == 3:
-            feats, bag_label, y_inst = batch
+
+        if args.use_softclt_aux:
+            feats, bag_label, y_inst, idx = batch
         else:
-            # 혹시 (feats, label)만 오는 경우 대비
-            feats, bag_label = batch
-            y_inst = None
+            if len(batch) == 3:
+                feats, bag_label, y_inst = batch
+            else:
+                # 혹시 (feats, label)만 오는 경우 대비
+                feats, bag_label = batch
+                y_inst = None
 
         x = feats.to(device)          # [B, T, D]
         y_bag = bag_label.to(device)  # [B, C] (multi-hot)

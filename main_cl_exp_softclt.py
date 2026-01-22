@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+from html import parser
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -46,6 +47,289 @@ from os.path import join
 # Suppress all warnings
 warnings.filterwarnings("ignore")
 
+import math
+
+from sklearn.preprocessing import MinMaxScaler
+from tslearn.metrics import dtw, dtw_path, gak
+from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
+
+def prepare_softclt_sim_matrix(
+    sim_mat_path: str,
+    trainset,
+    args,
+    is_main: bool,
+    world_size: int,
+):
+    """
+    sim_mat_path가 없으면 trainset으로 soft similarity matrix를 생성.
+    DDP 환경에서는 rank 0만 생성하고 barrier로 동기화.
+    """
+    if os.path.exists(sim_mat_path):
+        if is_main:
+            print(f"[SoftCLT] Found existing sim matrix: {sim_mat_path}")
+    else:
+        if is_main:
+            print(f"[SoftCLT] sim matrix not found. Building: {sim_mat_path}")
+            build_softclt_soft_matrix_from_dataset(
+                trainset,
+                type_=args.dist_metric,
+                min_=args.dist_min,
+                max_=args.dist_max,
+                multivariate=True,
+                densify_tau=args.densify_tau,
+                densify_alpha=args.densify_alpha,
+                out_path=sim_mat_path,
+            )
+        # 다른 rank들은 기다림
+        if world_size > 1 and dist.is_initialized():
+            dist.barrier()
+
+    # 로드
+    npz = np.load(sim_mat_path)
+    if "soft_matrix" in npz:
+        mat = npz["soft_matrix"]
+    elif "sim_mat" in npz:
+        mat = npz["sim_mat"]
+    else:
+        raise KeyError(
+            f"[SoftCLT] {sim_mat_path} keys={list(npz.keys())} "
+            "중 soft_matrix/sim_mat 없음"
+        )
+
+    return torch.from_numpy(mat).float().cpu()
+
+def _ensure_parent_dir(filepath: str):
+    parent = os.path.dirname(os.path.abspath(filepath))
+    if parent and (not os.path.exists(parent)):
+        os.makedirs(parent, exist_ok=True)
+
+def _to_tslearn_univar(x):
+    """
+    SoftCLT 원본은 UTS: shape [T] 를 reshape(-1,1)로 dtw에 넣습니다.
+    여기서는 x가 torch/np + [T, D] 혹은 [D, T] 혹은 [T]일 수 있으므로
+    "univariate 거리"를 만들기 위해 D>1이면 (권장) feature 평균으로 1D로 줄입니다.
+    """
+    if hasattr(x, "detach"):
+        x = x.detach().cpu().numpy()
+    x = np.asarray(x)
+
+    if x.ndim == 1:
+        uts = x.astype(np.float32, copy=False)
+    elif x.ndim == 2:
+        # [T,D] or [D,T]
+        # time axis를 크게 보고, 그 방향을 T로 가정
+        if x.shape[0] < x.shape[1] and x.shape[1] > 32:
+            x = x.T  # [T,D]로 맞춤
+        # D>1이면 univariate로 평균(SoftCLT UTS 버전 호환 목적)
+        uts = x.mean(axis=1).astype(np.float32, copy=False)  # [T]
+    else:
+        raise ValueError(f"Unsupported feats shape: {x.shape}")
+
+    return uts.reshape(-1, 1)  # tslearn dtw 입력 형태: [T,1]
+
+def _to_tslearn_mts(x):
+    """
+    입력 feats를 tslearn multivariate DTW 입력 형태 [T, D] (float32)로 변환.
+    - x: torch/np, shape could be [T,D] or [D,T] or [T]
+    """
+    if hasattr(x, "detach"):
+        x = x.detach().cpu().numpy()
+    x = np.asarray(x)
+
+    if x.ndim == 1:
+        # 단변량도 [T,1]로 확장해 multivariate 루틴에서 일관 처리 가능
+        mts = x.reshape(-1, 1).astype(np.float32, copy=False)
+        return mts
+
+    if x.ndim != 2:
+        raise ValueError(f"Unsupported feats shape for MTS: {x.shape}")
+
+    # [D,T] vs [T,D] 추정: 보통 T가 더 큼
+    if x.shape[0] < x.shape[1] and x.shape[1] > 32:
+        x = x.T  # [T,D]로 맞춤
+
+    return x.astype(np.float32, copy=False)  # [T,D]
+
+def get_DTW(UTS_tr):
+    N = len(UTS_tr)
+    dist_mat = np.zeros((N, N), dtype=np.float32)
+    for i in range(N):
+        for j in range(i + 1):
+            if i == j:
+                dist_mat[i, j] = 0.0
+            else:
+                d = dtw(UTS_tr[i], UTS_tr[j])
+                dist_mat[i, j] = d
+                dist_mat[j, i] = d
+    return dist_mat
+
+def get_MDTW(MTS_tr):
+    """
+    MTS_tr: list of np arrays, each [T, D]
+    """
+    N = len(MTS_tr)
+    dist_mat = np.zeros((N, N), dtype=np.float32)
+    for i in range(N):
+        for j in range(i + 1):
+            if i == j:
+                dist_mat[i, j] = 0.0
+            else:
+                d = dtw(MTS_tr[i], MTS_tr[j])  # tslearn multivariate DTW
+                dist_mat[i, j] = d
+                dist_mat[j, i] = d
+    return dist_mat
+
+def get_TAM(UTS_tr):
+    def find(condition):
+        res, = np.nonzero(np.ravel(condition))
+        return res
+
+    def tam(path):
+        delay = len(find(np.diff(path[0]) == 0))
+        advance = len(find(np.diff(path[1]) == 0))
+        incumbent = find((np.diff(path[0]) == 1) * (np.diff(path[1]) == 1))
+        phase = len(incumbent)
+
+        len_estimation = path[1][-1]
+        len_ref = path[0][-1]
+
+        p_advance = advance * 1.0 / len_ref
+        p_delay = delay * 1.0 / len_estimation
+        p_phase = phase * 1.0 / np.min([len_ref, len_estimation])
+        return p_advance + p_delay + (1.0 - p_phase)
+
+    N = len(UTS_tr)
+    dist_mat = np.zeros((N, N), dtype=np.float32)
+    for i in range(N):
+        for j in range(i + 1):
+            if i == j:
+                dist_mat[i, j] = 0.0
+            else:
+                path = dtw_path(UTS_tr[i], UTS_tr[j])[0]
+                p = [np.array([a for a, _ in path]), np.array([b for _, b in path])]
+                d = tam(p)
+                dist_mat[i, j] = d
+                dist_mat[j, i] = d
+    return dist_mat
+
+def get_GAK(UTS_tr):
+    N = len(UTS_tr)
+    dist_mat = np.zeros((N, N), dtype=np.float32)
+    for i in range(N):
+        for j in range(i + 1):
+            if i == j:
+                dist_mat[i, j] = 0.0
+            else:
+                d = gak(UTS_tr[i], UTS_tr[j])
+                dist_mat[i, j] = d
+                dist_mat[j, i] = d
+    return dist_mat
+
+def get_COS(MTS_tr_flat):
+    # SoftCLT 코드: cos_sim_matrix = -cosine_similarity(MTS_tr)
+    # 여기서는 "distance"가 필요하면 negative cosine similarity를 dist로 사용
+    return (-cosine_similarity(MTS_tr_flat)).astype(np.float32)
+
+def get_EUC(MTS_tr_flat):
+    return euclidean_distances(MTS_tr_flat).astype(np.float32)
+
+def save_sim_mat(X_tr, min_=0.0, max_=1.0, multivariate=False, type_='DTW'):
+    """
+    SoftCLT 원본 save_sim_mat 동일 로직 + multivariate DTW 지원.
+    """
+    if multivariate:
+        # SoftCLT 원본 코드에서는 multivariate일 때 DTW만 사용(원본 assert 의도)
+        if type_ != 'DTW':
+            raise ValueError("For multivariate=True, only type_='DTW' is supported (SoftCLT original behavior).")
+        dist_mat = get_MDTW(X_tr)  # X_tr is list of [T,D]
+    else:
+        if type_ == 'DTW':
+            dist_mat = get_DTW(X_tr)   # X_tr is list of [T,1]
+        elif type_ == 'TAM':
+            dist_mat = get_TAM(X_tr)
+        elif type_ == 'GAK':
+            dist_mat = get_GAK(X_tr)
+        elif type_ == 'COS':
+            dist_mat = get_COS(X_tr)
+        elif type_ == 'EUC':
+            dist_mat = get_EUC(X_tr)
+        else:
+            raise ValueError(f"Unknown type_: {type_}")
+
+    N = dist_mat.shape[0]
+
+    # (1) distance matrix: diag를 off-diag 최소로 채움 (원본과 동일)
+    diag_indices = np.diag_indices(N)
+    mask = np.ones(dist_mat.shape, dtype=bool)
+    mask[diag_indices] = False
+    temp = dist_mat[mask].reshape(N, N - 1)
+    dist_mat[diag_indices] = temp.min()
+
+    # (2) normalized distance matrix
+    scaler = MinMaxScaler(feature_range=(min_, max_))
+    dist_mat = scaler.fit_transform(dist_mat)
+
+    # (3) normalized similarity matrix
+    sim_mat = (1.0 - dist_mat).astype(np.float32)
+    return sim_mat
+
+def densify(sim_mat, tau, alpha):
+    # 원본과 동일
+    return ((2 * alpha) / (1 + np.exp(-tau * sim_mat))) + (1 - alpha) * np.eye(sim_mat.shape[0], dtype=np.float32)
+
+def topK_one_else_zero(matrix, k):
+    new_matrix = matrix.copy()
+    top_k_indices = np.argpartition(new_matrix, -(k + 1), axis=1)[:, -(k + 1):]
+    np.fill_diagonal(new_matrix, 0)
+    mask = np.zeros_like(new_matrix)
+    mask[np.repeat(np.arange(new_matrix.shape[0]), (k + 1)), top_k_indices.flatten()] = 1
+    return mask
+
+def convert_hard_matrix(soft_matrix, pos_ratio):
+    N = soft_matrix.shape[0]
+    num_pos = int((N - 1) * pos_ratio)
+    return topK_one_else_zero(soft_matrix, num_pos)
+
+def build_softclt_soft_matrix_from_dataset(dataset, type_='DTW', min_=0.0, max_=1.0,
+                                           multivariate=True,
+                                           densify_tau=None, densify_alpha=None,
+                                           out_path=None):
+    """
+    dataset -> X_tr(list) -> save_sim_mat -> (optional) densify -> 저장
+    multivariate=True이면 feats를 [T,D]로 만들어 MDTW(dist) 계산
+    """
+    N = len(dataset)
+
+    X = []
+    for i in range(N):
+        item = dataset[i]
+        feats = item[0]
+        if multivariate:
+            X.append(_to_tslearn_mts(feats))       # [T,D]
+        else:
+            X.append(_to_tslearn_univar(feats))    # [T,1]
+
+    soft_mat = save_sim_mat(X, min_=min_, max_=max_, multivariate=multivariate, type_=type_)
+
+    if densify_tau is not None and densify_alpha is not None:
+        soft_mat = densify(soft_mat, densify_tau, densify_alpha).astype(np.float32)
+
+    if out_path is not None:
+        _ensure_parent_dir(out_path)
+        np.savez_compressed(
+            out_path,
+            soft_matrix=soft_mat,
+            metric=type_,
+            multivariate=multivariate,
+            min_=min_,
+            max_=max_,
+            densify_tau=densify_tau,
+            densify_alpha=densify_alpha
+        )
+        print(f"[dist_mat] saved soft_matrix: {out_path}  shape={soft_mat.shape}")
+
+    return soft_mat
+
 # ----- DDP utils -----
 def setup_distributed():
     """
@@ -84,6 +368,21 @@ torch.cuda.manual_seed_all(seed)  # multi-GPU
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+
+class WithIndexDataset(torch.utils.data.Dataset):
+    def __init__(self, base_ds):
+        self.base_ds = base_ds
+
+    def __len__(self):
+        return len(self.base_ds)
+
+    def __getitem__(self, idx):
+        out = self.base_ds[idx]
+        idx_t = torch.tensor(idx, dtype=torch.long)
+
+        if isinstance(out, (tuple, list)):
+            return (*out, idx_t)   # <-- idx(int) 대신 idx_t(Tensor) 반환
+        return out, idx_t
 
 # ---------------------------------------------------------------------
 #   PrototypeBank & Losses
@@ -137,156 +436,126 @@ class PrototypeBank:
         dist.all_reduce(init_float, op=dist.ReduceOp.SUM)
         self.initialized = init_float > 0.0
 
-# class PrototypeBank:
-#     """
-#     클래스별 global prototype을 유지하는 뱅크.
-#     - prototypes: [C, D]
-#     - EMA(momentum)로 업데이트
-#     - 아직 한 번도 관측 안 된 클래스는 initialized[c] == False
-#     """
-#     def __init__(self, num_classes: int, dim: int, device, momentum: float = 0.9):
-#         self.num_classes = num_classes
-#         self.dim = dim
-#         self.momentum = momentum
-#         self.device = device
 
-#         self.prototypes = torch.zeros(num_classes, dim, device=device)
-#         self.initialized = torch.zeros(num_classes, dtype=torch.bool, device=device)
+def _densify_from_dist(dist_sub: torch.Tensor, tau: float, alpha: float):
+    """
+    dist_sub: [B,B] 거리 (작을수록 유사)
+    returns soft assignment W: [B,B], rows sum to 1, diagonal=0
+    """
+    # logits = -dist / tau
+    logits = -dist_sub / max(tau, 1e-6)
+    # remove self
+    logits.fill_diagonal_(-1e9)
 
-#     @torch.no_grad()
-#     def update(self, x_cls: torch.Tensor, bag_label: torch.Tensor):
-#         """
-#         x_cls: [B, C, D]
-#         bag_label: [B, C] (multi-hot)
-#         label[b, c] == 1 인 bag들에서 x_cls[b, c]를 평균 내고 EMA로 업데이트
-#         """
-#         B, C, D = x_cls.shape
-#         assert C == self.num_classes and D == self.dim
+    # softmax => weights
+    W = torch.softmax(logits, dim=1)
 
-#         for c in range(C):
-#             mask = bag_label[:, c] > 0
-#             if mask.any():
-#                 cls_c = x_cls[mask, c, :]          # [N_c, D]
-#                 proto_batch = cls_c.mean(dim=0)    # [D]
-#                 if self.initialized[c]:
-#                     m = self.momentum
-#                     self.prototypes[c] = m * self.prototypes[c] + (1.0 - m) * proto_batch
-#                 else:
-#                     self.prototypes[c] = proto_batch
-#                     self.initialized[c] = True
+    # optional sharpening: alpha>0 makes distribution peakier
+    if alpha is not None and alpha > 0:
+        W = W ** (1.0 + alpha)
+        W = W / (W.sum(dim=1, keepdim=True) + 1e-12)
 
-#     def get(self):
-#         return self.prototypes, self.initialized
+    # keep diagonal 0
+    W.fill_diagonal_(0.0)
+    return W
 
-# def instance_prototype_contrastive_loss(
-#     x_seq: torch.Tensor,        # [B, T, D]  (z_t)
-#     bag_label: torch.Tensor,    # [B, C]     (multi-hot, bag-level)
-#     proto_bank: PrototypeBank,
-#     tau: float = 0.1,
-#     sim_thresh: float = 0.7,
-#     win: int = 5,
-# ):
-#     """
-#     1) z_{b,t}가 feature space에서 어떤 class prototype과 충분히 가까우면
-#        -> 그 class를 positive
-#     2) 어떤 class와도 가까운 게 없으면 (ambiguous)
-#        -> temporal neighbor들 중에서 prototype boundary 안에 들어가는 애가 있는지 확인,
-#           있으면 그 class를 positive
-#     3) 둘 다 안 되면 anchor로 사용하지 않음.
+def _densify_from_sim(sim_sub: torch.Tensor, tau: float, alpha: float):
+    """
+    sim_sub: [B,B] 유사도 (클수록 유사)
+    returns soft assignment W: [B,B], rows sum to 1, diagonal=0
 
-#     그 다음, anchor로 선택된 (b,t)에 대해
-#     - anchor: z_{b,t}
-#     - positive: 해당 class prototype p_c
-#     - negatives: 모든 prototype p_k
-#     로 InfoNCE 계산.
-#     """
-#     device = x_seq.device
-#     prototypes, initialized = proto_bank.get()        # [C, D], [C]
+    - SoftCLT에서 저장한 soft_matrix(=normalized similarity)를 그대로 사용할 때 쓰는 버전
+    - tau: temperature (작을수록 더 peak)
+    - alpha: optional sharpening (>=0) (클수록 더 peak)
+    """
+    # logits = sim / tau  (similarity는 클수록 positive)
+    logits = sim_sub / max(tau, 1e-6)
 
-#     if not initialized.any():
-#         return torch.tensor(0.0, device=device)
+    # remove self
+    logits.fill_diagonal_(-1e9)
 
-#     B, T, D = x_seq.shape
-#     C = prototypes.shape[0]
-#     assert bag_label.shape == (B, C)
+    # softmax => weights
+    W = torch.softmax(logits, dim=1)
 
-#     # cosine normalize
-#     x_norm = F.normalize(x_seq, dim=-1)               # [B, T, D]
-#     p_norm = F.normalize(prototypes, dim=-1)          # [C, D]
+    # optional sharpening: alpha>0 makes distribution peakier
+    if alpha is not None and alpha > 0:
+        W = W ** (1.0 + alpha)
+        W = W / (W.sum(dim=1, keepdim=True) + 1e-12)
 
-#     # similarity: S[b, t, c] = <z_{b,t}, p_c>
-#     S_full = torch.einsum('btd,cd->btc', x_norm, p_norm)  # [B, T, C]
-#     S = S_full.clone()
+    # keep diagonal 0
+    W.fill_diagonal_(0.0)
+    return W
 
-#     # positive 후보는:
-#     #  - 해당 bag에 존재하는 class (bag_label[b, c] == 1)
-#     #  - prototype이 초기화된 class만
-#     valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B, 1, C]
-#     S_valid = S.masked_fill(~valid_class_mask, -1e9)   # positive 후보가 아닌 class는 -inf 취급
 
-#     anchors_b = []
-#     anchors_t = []
-#     anchors_c = []
-#     anchor_conf = []
+def softclt_instance_loss(x_seq: torch.Tensor,
+                          idx: torch.Tensor,
+                          dist_mat_full_cpu: torch.Tensor,
+                          tau_inst: float,
+                          alpha: float):
+    """
+    x_seq: [B,T,D] (from your model)
+    idx:   [B] dataset indices for lookup
+    dist_mat_full_cpu: [N,N] on CPU
+    """
+    device = x_seq.device
+    B, T, D = x_seq.shape
 
-#     for b in range(B):
-#         for t in range(T):
-#             sims_bt = S_valid[b, t]        # [C], invalid는 -1e9
-#             max_sim, c_star = sims_bt.max(dim=-1)
+    # bag embedding (minimal intrusion): mean over time
+    z = x_seq.mean(dim=1)                     # [B,D]
+    z = F.normalize(z, dim=-1)
 
-#             if max_sim >= sim_thresh:
-#                 # 규칙 1: 직접 prototype 근처
-#                 anchors_b.append(b)
-#                 anchors_t.append(t)
-#                 anchors_c.append(c_star)
-#             else:
-#                 # 규칙 2: ambiguous -> temporal neighbor 찾아보기
-#                 t_min = max(0, t - win)
-#                 t_max = min(T - 1, t + win)
-#                 if t_min == t_max:
-#                     continue
+    # sub distance matrix from full (CPU -> GPU)
+    idx_cpu = idx.detach().cpu()
+    dist_sub = dist_mat_full_cpu.index_select(0, idx_cpu).index_select(1, idx_cpu)  # [B,B] CPU
+    dist_sub = dist_sub.to(device=device, non_blocking=True)
 
-#                 sims_neighbors = S_valid[b, t_min:t_max+1]      # [L, C]
-#                 max_sim_nei, c_nei = sims_neighbors.max(dim=-1)  # [L], [L]
+    # W = _densify_from_dist(dist_sub, tau=tau_inst, alpha=alpha)  # [B,B]
+    W = _densify_from_sim(dist_sub, tau=tau_inst, alpha=alpha)
 
-#                 # 이웃들 중 최댓값과 그 class
-#                 max_sim_neighbor, idx_nei = max_sim_nei.max(dim=0)
-#                 c_best = c_nei[idx_nei]
+    # logits among batch samples
+    logits = torch.matmul(z, z.t()) / max(tau_inst, 1e-6)  # [B,B]
+    logits.fill_diagonal_(-1e9)
+    logp = F.log_softmax(logits, dim=1)                    # [B,B]
 
-#                 if max_sim_neighbor >= sim_thresh:
-#                     anchors_b.append(b)
-#                     anchors_t.append(t)
-#                     anchors_c.append(c_best)
-#                     anchor_conf.append(max_sim_neighbor.item())
+    # soft cross-entropy
+    loss = -(W * logp).sum(dim=1).mean()
+    return loss
 
-#     # ★ 루프 전체가 끝난 뒤에 anchor 존재 여부 체크
-#     if len(anchors_b) == 0:
-#         return torch.tensor(0.0, device=device)
 
-#     b_idx = torch.tensor(anchors_b, device=device, dtype=torch.long)
-#     t_idx = torch.tensor(anchors_t, device=device, dtype=torch.long)
-#     c_idx = torch.tensor(anchors_c, device=device, dtype=torch.long)
-#     N = b_idx.size(0)
+def softclt_temporal_loss(x_seq: torch.Tensor,
+                          tau_temp: float,
+                          win: int,
+                          sigma: float):
+    """
+    Temporal soft assignment within each sequence.
+    For each time t, target distribution puts mass on [t-win, t+win] using Gaussian over |dt|.
+    x_seq: [B,T,D]
+    """
+    device = x_seq.device
+    B, T, D = x_seq.shape
+    z = F.normalize(x_seq, dim=-1)                   # [B,T,D]
 
-#     # anchor feature: z_anchor = z_{b,t}
-#     z_anchor = x_norm[b_idx, t_idx, :]      # [N, D]
+    # sim over time within each sample: [B,T,T]
+    sim = torch.matmul(z, z.transpose(1, 2)) / max(tau_temp, 1e-6)
 
-#     # prototype 전체와 similarity (negatives까지 포함)
-#     sim_all = torch.matmul(z_anchor, p_norm.t()) / tau   # [N, C]
-#     pos_sim = sim_all[torch.arange(N, device=device), c_idx]  # [N]
-#     log_all = torch.logsumexp(sim_all, dim=-1)                # [N]
-#     base = pos_sim - log_all                                  # [N]
+    # build soft targets: [T,T] same for all B
+    t = torch.arange(T, device=device)
+    dt = (t[None, :] - t[:, None]).abs().float()     # [T,T]
+    mask = (dt <= float(win)).float()                # [T,T]
 
-#     # --- class-balanced weighting ---
-#     with torch.no_grad():
-#         counts = torch.bincount(c_idx, minlength=C).float()   # [C]
-#         weights_per_class = torch.zeros(C, device=device)
-#         valid = counts > 0
-#         weights_per_class[valid] = counts.sum() / counts[valid]
+    # gaussian weights on dt
+    w = torch.exp(-(dt ** 2) / (2.0 * max(sigma, 1e-6) ** 2)) * mask
+    w.fill_diagonal_(0.0)
 
-#     w = weights_per_class[c_idx]   # [N]
-#     loss = -(base * w).sum() / (w.sum() + 1e-6)
-#     return loss
+    w = w / (w.sum(dim=1, keepdim=True) + 1e-12)     # row-normalize
+    w = w.unsqueeze(0).expand(B, -1, -1)             # [B,T,T]
+
+    # log softmax over candidate times
+    sim = sim.masked_fill(torch.eye(T, device=device).bool().unsqueeze(0), -1e9)
+    logp = F.log_softmax(sim, dim=2)                 # [B,T,T]
+
+    loss = -(w * logp).sum(dim=2).mean()             # mean over (B,T)
+    return loss
 
 def instance_prototype_contrastive_loss(
     x_seq: torch.Tensor,        # [B, T, D]
@@ -393,7 +662,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_sco
 # ---------------------------------------------------------------------
 #   Train / Test (DDP-aware)
 # ---------------------------------------------------------------------
-def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=None, is_main=True, world_size=1):
+def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=None, is_main=True, world_size=1, dist_mat_full_cpu=None):
     milnet.train()
     total_loss = 0
     sum_bag = 0.0
@@ -407,15 +676,16 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
     sum_total = 0.0
     n = 0
 
-    for batch_id, (feats, label) in enumerate(trainloader):
+    for batch_id, batch in enumerate(trainloader):
+        feats, label, idx = batch
         bag_feats = feats.to(device)
         bag_label = label.to(device)   # [B, C] multi-hot
 
-        # if args.dropout_patch > 0:
-        #     selecy_window_indx = random.sample(range(10), int(args.dropout_patch * 10))
-        #     inteval = int(len(bag_feats) // 10)
-        #     for idx in selecy_window_indx:
-        #         bag_feats[:, idx * inteval:idx * inteval + inteval, :] = torch.randn(1, device=device)
+        if args.dropout_patch > 0:
+            selecy_window_indx = random.sample(range(10), int(args.dropout_patch * 10))
+            inteval = int(len(bag_feats) // 10)
+            for pidx in selecy_window_indx:
+                bag_feats[:, pidx * inteval:pidx * inteval + inteval, :] = torch.randn(1, device=device)
 
         optimizer.zero_grad()
 
@@ -440,54 +710,29 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         ortho_loss = torch.tensor(0.0, device=device)
         smooth_loss = torch.tensor(0.0, device=device)
         sparsity_loss = torch.tensor(0.0, device=device)
-        proto_inst_loss = torch.tensor(0.0, device=device)
-        cls_contrast_loss = torch.tensor(0.0, device=device)
-
+        soft_aux_loss = torch.tensor(0.0, device=device)
         if instance_pred is not None:
-            # ---------- 기존 MIL 부분 ----------
-            # p_inst = torch.sigmoid(instance_pred)        # [B, T, C]
-            # eps = 1e-6
-            # p_bag_from_inst = 1 - torch.prod(
-            #     torch.clamp(1 - p_inst, min=eps), dim=1
-            # )                                           # [B, C]
-            # inst_loss = F.binary_cross_entropy(
-            #     p_bag_from_inst, bag_label.float()
-            # )
-            # p_inst = instance_pred.mean(dim=1)       # [B, C]
             inst_loss = criterion(instance_pred, bag_label)
 
-            # ortho_loss = class_token_orthogonality_loss(x_cls)
-
-            # pos_mask = (bag_label.sum(dim=0) > 0).float()   # [C]
-
-            instance_pred_s = torch.sigmoid(weighted_instance_pred)
-            p_inst_s = instance_pred_s.mean(dim=1)
-            sparsity_per_class = p_inst_s.mean(dim=(0, 1))    # [C]
-            # if pos_mask.sum() > 0:
-            #     sparsity_loss = (sparsity_per_class * pos_mask).sum() / (
-            #         pos_mask.sum() + 1e-6
-            #     )
-            # else:
-                # sparsity_loss = torch.tensor(0.0, device=device)
-            sparsity_loss = sparsity_per_class.mean()   # pos_mask 제거 버전
-
-            # diff = p_inst[:, 1:, :] - p_inst[:, :-1, :]   # [B, T-1, C]
-            # diff = diff * pos_mask[None, None, :]
-            # smooth_loss = (diff ** 2).mean()
-
-            # ---------- prototype 기반 instance CL ----------
-            if (epoch >= args.epoch_des) and (proto_bank is not None):
-                proto_bank.update(x_cls.detach(), bag_label)
-                if world_size > 1:
-                    proto_bank.sync(world_size)
-                proto_inst_loss = instance_prototype_contrastive_loss(
-                    x_seq,
-                    bag_label,
-                    proto_bank,
-                    tau=getattr(args, "proto_tau", 0.1),
-                    sim_thresh=getattr(args, "proto_sim_thresh", 0.7),
-                    win=getattr(args, "proto_win", 5),
-                )
+        if args.use_softclt_aux and (epoch >= args.epoch_des):
+            # SoftCLT auxiliary losses (instance-wise + temporal)
+            # x_seq is required; AmbiguousMILwithCL already returns x_seq   
+            # If your model path can produce x_seq only when instance_pred exists,
+            # this block naturally activates only in that regime.
+            L_inst = softclt_instance_loss(
+                x_seq=x_seq,
+                idx=idx.to(device=device),
+                dist_mat_full_cpu=dist_mat_full_cpu,
+                tau_inst=args.soft_tau_inst,
+                alpha=args.soft_alpha,
+            )
+            L_temp = softclt_temporal_loss(
+                x_seq=x_seq,
+                tau_temp=args.soft_tau_temp,
+                win=args.soft_temp_win,
+                sigma=args.soft_temp_sigma,
+            )
+            soft_aux_loss = args.soft_lambda * L_inst + (1.0 - args.soft_lambda) * L_temp
 
         # 최종 loss
         if args.model == 'AmbiguousMIL':
@@ -497,7 +742,7 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                 # + args.ortho_loss_w * ortho_loss
                 # + args.smooth_loss_w * smooth_loss
                 + args.sparsity_loss_w * sparsity_loss
-                + args.proto_loss_w * proto_inst_loss
+                + args.proto_loss_w * soft_aux_loss
                 # + args.cls_contrast_w * cls_contrast_loss
             )
         else:
@@ -520,7 +765,8 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         # sum_ortho += ortho_loss.item()
         # sum_smooth += smooth_loss.item()
         sum_sparsity += sparsity_loss.item()
-        sum_proto_inst += proto_inst_loss.item()
+        # sum_proto_inst += proto_inst_loss.item()
+        sum_proto_inst += soft_aux_loss.item()
         # sum_cls_contrast += cls_contrast_loss.item()
         sum_total += loss.item()
         n += 1
@@ -570,11 +816,9 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
         for batch_id, batch in enumerate(testloader):
 
             if args.datatype == "mixed":
-                feats, label, y_inst = batch
+                feats, label, y_inst, idx = batch
             else:
-                feats, label = batch
-                y_inst = None
-            
+                feats, label, idx = batch
             bag_feats = feats.to(device)
             bag_label = label.to(device)   # [B, C]
 
@@ -649,15 +893,15 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 # smooth_loss = (diff ** 2).mean()
 
                 # prototype 기반 instance CL (eval에서는 update 없이 loss만)
-                if (epoch >= args.epoch_des) and (proto_bank is not None):
-                    proto_inst_loss = instance_prototype_contrastive_loss(
-                        x_seq,
-                        bag_label,
-                        proto_bank,
-                        tau=getattr(args, "proto_tau", 0.1),
-                        sim_thresh=getattr(args, "proto_sim_thresh", 0.7),
-                        win=getattr(args, "proto_win", 5),
-                    )
+                # if (epoch >= args.epoch_des) and (proto_bank is not None):
+                #     proto_inst_loss = instance_prototype_contrastive_loss(
+                #         x_seq,
+                #         bag_label,
+                #         proto_bank,
+                #         tau=getattr(args, "proto_tau", 0.1),
+                #         sim_thresh=getattr(args, "proto_sim_thresh", 0.7),
+                #         win=getattr(args, "proto_win", 5),
+                #     )
 
             if args.datatype == "mixed" and (y_inst is not None):
                 # y_inst: [B, T, C] one-hot instance labels
@@ -838,9 +1082,40 @@ def main():
     parser.add_argument('--dba_window', type=int, default=12000, help='Sliding window length (time steps) for DBA dataset')
     parser.add_argument('--dba_stride', type=int, default=6000, help='Sliding window stride for DBA dataset')
     parser.add_argument('--dba_test_ratio', type=float, default=0.2, help='Train/Test split ratio (sequence-level) for DBA dataset')
-    
+
+    # --- SoftCLT auxiliary losses (replace proto_inst_loss) ---
     parser.add_argument('--use_softclt_aux', action='store_true',
                         help='Use SoftCLT (instance-wise + temporal) auxiliary losses instead of proto_inst_loss')
+    parser.add_argument('--sim_mat_path', type=str, default='',
+                        help='Path to precomputed similarity matrix for TRAINSET indices (npz with key "sim_mat" or "dist_mat")')
+    parser.add_argument('--soft_tau_inst', type=float, default=0.1,
+                        help='temperature for instance-wise soft contrastive')
+    parser.add_argument('--soft_tau_temp', type=float, default=0.1,
+                        help='temperature for temporal soft contrastive')
+    parser.add_argument('--soft_alpha', type=float, default=0.5,
+                        help='row sharpening for soft assignment (>=0); higher = peakier')
+    parser.add_argument('--soft_lambda', type=float, default=0.5,
+                        help='mixing weight: lambda*L_inst + (1-lambda)*L_temp')
+    parser.add_argument('--soft_temp_win', type=int, default=5,
+                        help='temporal soft positive window radius')
+    parser.add_argument('--soft_temp_sigma', type=float, default=2.0,
+                        help='gaussian sigma (in timesteps) for temporal soft target distribution')
+    
+    parser.add_argument('--build_dist_mat', action='store_true',
+                        help='If set, build dist_mat_full from TRAINSET and save to --dist_out then exit.')
+    parser.add_argument('--dist_out', type=str, default='./dist_mat_train.npz',
+                        help='Output .npz path for dist_mat_full')
+    parser.add_argument('--dist_metric', type=str, default='DTW',
+                        choices=['DTW','TAM','GAK','COS','EUC'],
+                        help='Metric for building similarity matrix (SoftCLT style)')
+
+    parser.add_argument('--dist_min', type=float, default=0.0, help='Min for MinMaxScaler')
+    parser.add_argument('--dist_max', type=float, default=1.0, help='Max for MinMaxScaler')
+    parser.add_argument('--dist_max_items', type=int, default=0,
+                        help='If >0, compute dist matrix only for first K items (debug)')
+    
+    parser.add_argument('--densify_tau', type=float, default=None)
+    parser.add_argument('--densify_alpha', type=float, default=None)
     
     args = parser.parse_args()
 
@@ -903,118 +1178,19 @@ def main():
 
     criterion = nn.BCEWithLogitsLoss()
 
-    def _dataset_to_X_yidx(ds, device="cpu"):
-        """
-        loadorean()이 만든 Dataset에서 전체를 꺼내
-        X: [N, T, D] float tensor
-        y_idx: [N] long tensor (0..C-1)
-        로 변환합니다.
-
-        ds[i]가 (x, y) 또는 (x, y, ...) 형태여도 첫 2개만 사용합니다.
-        y가 one-hot이면 argmax로 idx를 만듭니다.
-        """
-        X_list = []
-        y_list = []
-
-        for i in range(len(ds)):
-            item = ds[i]
-            if isinstance(item, (tuple, list)):
-                x = item[0]
-                y = item[1]
-            else:
-                raise ValueError("Dataset item must be tuple/list like (x, y)")
-
-            # x: [T, D] or [D, T] 등 가능성이 있으면 여기서 정규화
-            # 현재 코드 흐름 상 loadorean은 보통 [T, D]를 준다고 가정합니다.
-            if not torch.is_tensor(x):
-                x = torch.tensor(x)
-            x = x.float()
-
-            if not torch.is_tensor(y):
-                y = torch.tensor(y)
-
-            # y가 one-hot([C]) 또는 scalar일 수 있음
-            if y.ndim > 0 and y.numel() > 1:
-                y_idx = int(torch.argmax(y).item())
-            else:
-                y_idx = int(y.item())
-
-            X_list.append(x)
-            y_list.append(y_idx)
-
-        X = torch.stack(X_list, dim=0).to(device)                 # [N, T, D]
-        y_idx = torch.tensor(y_list, dtype=torch.long, device=device)  # [N]
-        return X, y_idx
-
-    # # ---------------- 데이터 구성 ----------------
-    # if args.dataset in ['JapaneseVowels','SpokenArabicDigits','CharacterTrajectories','InsectWingbeat']:
-    #     trainset = loadorean(args, split='train')
-    #     testset = loadorean(args, split='test')
-
-    #     seq_len,num_classes,L_in=trainset.max_len,trainset.num_class,trainset.feat_in
-
-    #     if is_main:
-    #         print(f'max length {seq_len}')
-    #     args.feats_size = L_in
-    #     args.num_classes =  num_classes
-    #     if is_main:
-    #         print(f'num class:{args.num_classes}' )
+    # ---------------- 데이터 구성 ----------------
     if args.dataset in ['JapaneseVowels','SpokenArabicDigits','CharacterTrajectories','InsectWingbeat']:
-        train_base = loadorean(args, split='train')
-        test_base  = loadorean(args, split='test')
+        trainset = loadorean(args, split='train')
+        testset = loadorean(args, split='test')
 
-        base_T = train_base.max_len
-        num_classes = train_base.num_class
-        L_in = train_base.feat_in
+        seq_len,num_classes,L_in=trainset.max_len,trainset.num_class,trainset.feat_in
 
         if is_main:
-            print(f"[{args.dataset}] base max_len={base_T}, num_classes={num_classes}, feat_in={L_in}")
-
-        # 공통 args 갱신(입력 피처/클래스 수)
+            print(f'max length {seq_len}')
         args.feats_size = L_in
-        args.num_classes = num_classes
-
-        if args.datatype == "original":
-            # 기존대로 사용
-            trainset = train_base
-            testset  = test_base
-            seq_len  = base_T
-            args.seq_len = seq_len
-
-        elif args.datatype == "mixed":
-            # loadorean dataset -> (X, y_idx)로 변환 후 mixed bag으로 래핑
-            # 주의: mixed bag은 길이가 concat_k * T가 되므로 seq_len도 그에 맞춰야 합니다.
-            Xtr, ytr_idx = _dataset_to_X_yidx(train_base, device="cpu")
-            Xte, yte_idx = _dataset_to_X_yidx(test_base,  device="cpu")
-
-            concat_k = 2  # 원하시면 args로 빼셔도 됩니다(예: --concat_k)
-            trainset = MixedSyntheticBagsConcatK(
-                X=Xtr,
-                y_idx=ytr_idx,
-                num_classes=num_classes,
-                total_bags=len(Xtr),      # 필요시 더 크게(예: 5000)도 가능
-                concat_k=concat_k,
-                seed=args.seed,
-                return_instance_labels=False,
-            )
-            testset = MixedSyntheticBagsConcatK(
-                X=Xte,
-                y_idx=yte_idx,
-                num_classes=num_classes,
-                total_bags=len(Xte),
-                concat_k=concat_k,
-                seed=args.seed + 1,
-                return_instance_labels=True,   # mixed eval에서 inst acc 쓰려면 True
-            )
-
-            seq_len = concat_k * base_T
-            args.seq_len = seq_len
-
-            if is_main:
-                print(f"[{args.dataset}] mixed concat_k={concat_k} -> seq_len={seq_len}")
-
-        else:
-            raise ValueError(f"Unsupported datatype '{args.datatype}' for {args.dataset}")
+        args.num_classes =  num_classes
+        if is_main:
+            print(f'num class:{args.num_classes}' )
 
     elif args.dataset in ['PAMAP2']:
         trainset = loadorean(args, split='train')
@@ -1057,6 +1233,7 @@ def main():
                 seed=args.seed+1,
                 return_instance_labels=True,
             )
+
         else:
             raise ValueError(f"Unsupported datatype '{args.datatype}' for DBA dataset")
 
@@ -1107,10 +1284,32 @@ def main():
 
         args.seq_len = seq_len
         args.feats_size = L_in
+        
         if is_main:
             print(f'num class: {args.num_classes}')
             print(f'total_len: {SYN_TOTAL_LEN}')
+    
+    trainset = WithIndexDataset(trainset)
+    testset  = WithIndexDataset(testset)
 
+    if args.build_dist_mat:
+        if is_main:
+            build_softclt_soft_matrix_from_dataset(
+                trainset,
+                type_=args.dist_metric,
+                min_=args.dist_min,
+                max_=args.dist_max,
+                multivariate=True,  # 필요 시 argparse로 받도록
+                densify_tau=args.densify_tau,
+                densify_alpha=args.densify_alpha,
+                out_path=args.dist_out,
+            )
+        if world_size > 1 and dist.is_initialized():
+            dist.barrier()
+        if is_main and wandb.run is not None:
+            wandb.finish()
+        cleanup_distributed()
+        return
     # ---------------- 모델 구성 ----------------
     if args.model =='TimeMIL':
         base_model = TimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len).to(device)
@@ -1189,6 +1388,18 @@ def main():
         sampler=test_sampler
     )
 
+    sim_mat_full_cpu = None
+    if args.use_softclt_aux:
+        assert args.sim_mat_path, "--use_softclt_aux 인 경우 --sim_mat_path가 필요합니다."
+
+        sim_mat_full_cpu = prepare_softclt_sim_matrix(
+            sim_mat_path=args.sim_mat_path,
+            trainset=trainset,
+            args=args,
+            is_main=is_main,
+            world_size=world_size,
+        )
+
     def _four_sig(val: float):
         """Return value rounded to 4 significant figures (as float) for tie checks."""
         return float(f"{val:.4g}")
@@ -1237,7 +1448,11 @@ def main():
         if isinstance(trainloader.sampler, DistributedSampler):
             trainloader.sampler.set_epoch(epoch)
 
-        train_loss_bag = train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=proto_bank, is_main=is_main, world_size=world_size)
+        train_loss_bag = train(
+            trainloader, milnet, criterion, optimizer, epoch, args, device,
+            dist_mat_full_cpu=sim_mat_full_cpu,
+            is_main=is_main, world_size=world_size
+        )
 
         # validation은 rank 0에서만 수행
         if is_main:

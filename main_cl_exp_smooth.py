@@ -43,6 +43,21 @@ from compute_aopcr import compute_classwise_aopcr
 
 from os.path import join
 
+class LearnableGaussianSigma(nn.Module):
+    """
+    sigma > 0 learnable parameter (used for distance-based Gaussian weighting)
+    w(d) = exp(-d^2 / (2*sigma^2))
+    """
+    def __init__(self, init_sigma: float = 7.0, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        init = torch.tensor(init_sigma, dtype=torch.float32)
+        # softplus^-1 근사로 초기화 (sigma ~ init_sigma로 시작)
+        self.log_sigma = nn.Parameter(torch.log(torch.expm1(init)))
+
+    def sigma(self):
+        return F.softplus(self.log_sigma) + self.eps
+
 # Suppress all warnings
 warnings.filterwarnings("ignore")
 
@@ -295,6 +310,7 @@ def instance_prototype_contrastive_loss(
     tau: float = 0.1,
     sim_thresh: float = 0.7,
     win: int = 5,
+    gauss_sigma: "LearnableGaussianSigma" = None,   # ★ 추가
 ):
     """
     벡터화 버전:
@@ -326,28 +342,37 @@ def instance_prototype_contrastive_loss(
     valid_class_mask = (bag_label > 0).unsqueeze(1) & initialized.view(1, 1, C)  # [B,1,C]
     S_valid = S_valid.masked_fill(~valid_class_mask, -1e9)
 
-    # 3. direct non-ambiguous: per (b,t)에서 class 최대
-    S_tmax, c_argmax = S_valid.max(dim=-1)  # [B,T], [B,T]
-    direct_pos_mask = (S_tmax >= sim_thresh)  # [B,T]
+    # 3. direct non-ambiguous
+    S_tmax, c_argmax = S_valid.max(dim=-1)      # [B,T], [B,T]
+    direct_pos_mask = (S_tmax >= sim_thresh)    # [B,T]
 
-    # 4. temporal neighbor-based ambiguous matching (sliding window max over time)
+    # default: anchor weights = 1
+    anchor_weight_bt = torch.ones_like(S_tmax)  # [B,T]
+
+    # 4. temporal neighbor-based ambiguous matching (hard argmax)
     if win > 0:
-        # padding 후 unfold로 윈도우 생성: [B,T,2*win+1]
-        S_padded = F.pad(S_tmax, (win, win), value=-1e9)
-        windows = S_padded.unfold(dimension=1, size=2 * win + 1, step=1)  # [B,T,2*win+1]
+        S_padded = F.pad(S_tmax, (win, win), value=-1e9)  # [B, T+2win]
+        windows = S_padded.unfold(dimension=1, size=2 * win + 1, step=1)  # [B,T,W]
 
         nei_max, idx_in_win = windows.max(dim=-1)  # [B,T], [B,T]
         neighbor_pos_mask = (~direct_pos_mask) & (nei_max >= sim_thresh)
 
         # neighbor 시점 t' 계산
-        t_arange = torch.arange(T, device=device).view(1, T)  # [1,T]
-        neighbor_t = t_arange - win + idx_in_win              # [B,T]
-        neighbor_t = neighbor_t.clamp(0, T - 1)
+        t_arange = torch.arange(T, device=device).view(1, T)
+        neighbor_t = (t_arange - win + idx_in_win).clamp(0, T - 1)  # [B,T]
 
         # neighbor 시점에서의 best class
         c_nei = c_argmax.gather(1, neighbor_t)  # [B,T]
+
+        # ★ 거리 기반 Gaussian weight (ambiguous anchor들만 약하게)
+        if gauss_sigma is not None:
+            # idx_in_win in [0..2win], center is win
+            d = (idx_in_win - win).abs().float()              # [B,T]
+            sigma = gauss_sigma.sigma()                       # scalar
+            w_dist = torch.exp(-(d ** 2) / (2.0 * sigma ** 2))  # [B,T] in (0,1]
+            anchor_weight_bt = torch.where(neighbor_pos_mask, w_dist, anchor_weight_bt)
+
     else:
-        nei_max = torch.full_like(S_tmax, -1e9)
         neighbor_pos_mask = torch.zeros_like(S_tmax, dtype=torch.bool)
         c_nei = torch.zeros_like(c_argmax)
 
@@ -356,36 +381,35 @@ def instance_prototype_contrastive_loss(
     if not anchors_mask.any():
         return torch.tensor(0.0, device=device)
 
-    # 각 위치별 최종 class index (direct vs neighbor 중 선택)
     c_all = torch.where(direct_pos_mask, c_argmax, c_nei)  # [B,T]
 
-    # (b,t,c) 인덱스를 1D 텐서로 뽑기
-    b_idx_full = torch.arange(B, device=device).view(B, 1).expand(B, T)  # [B,T]
-    t_idx_full = torch.arange(T, device=device).view(1, T).expand(B, T)  # [B,T]
+    b_idx_full = torch.arange(B, device=device).view(B, 1).expand(B, T)
+    t_idx_full = torch.arange(T, device=device).view(1, T).expand(B, T)
 
-    b_idx = b_idx_full[anchors_mask]  # [N]
-    t_idx = t_idx_full[anchors_mask]  # [N]
-    c_idx = c_all[anchors_mask]       # [N]
+    b_idx = b_idx_full[anchors_mask]       # [N]
+    t_idx = t_idx_full[anchors_mask]       # [N]
+    c_idx = c_all[anchors_mask]            # [N]
+    anchor_w = anchor_weight_bt[anchors_mask]  # ★ [N]
     N = b_idx.size(0)
 
     # 6. InfoNCE 계산
-    z_anchor = x_norm[b_idx, t_idx, :]      # [N,D]
-
-    # anchor vs all prototypes
-    sim_all = torch.matmul(z_anchor, p_norm.t()) / tau   # [N,C]
+    z_anchor = x_norm[b_idx, t_idx, :]  # [N,D]
+    sim_all = torch.matmul(z_anchor, p_norm.t()) / tau  # [N,C]
     pos_sim = sim_all[torch.arange(N, device=device), c_idx]  # [N]
-    log_all = torch.logsumexp(sim_all, dim=-1)                 # [N]
-    base = pos_sim - log_all                                   # [N]
+    log_all = torch.logsumexp(sim_all, dim=-1)  # [N]
+    base = pos_sim - log_all  # [N]
 
-    # class-balanced weighting (그대로 유지)
+    # class-balanced weighting
     with torch.no_grad():
-        counts = torch.bincount(c_idx, minlength=C).float()   # [C]
+        counts = torch.bincount(c_idx, minlength=C).float()
         weights_per_class = torch.zeros(C, device=device)
         valid = counts > 0
         weights_per_class[valid] = counts.sum() / counts[valid]
 
-    w = weights_per_class[c_idx]   # [N]
-    loss = -(base * w).sum() / (w.sum() + 1e-6)
+    w_class = weights_per_class[c_idx]            # [N]
+    w_total = w_class * anchor_w                  # ★ [N] (ambiguous면 거리 가중치로 약해짐)
+
+    loss = -(base * w_total).sum() / (w_total.sum() + 1e-6)
     return loss
 
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, average_precision_score
@@ -393,7 +417,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_sco
 # ---------------------------------------------------------------------
 #   Train / Test (DDP-aware)
 # ---------------------------------------------------------------------
-def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=None, is_main=True, world_size=1):
+def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=None, is_main=True, world_size=1, gauss_sigma=None):
     milnet.train()
     total_loss = 0
     sum_bag = 0.0
@@ -411,11 +435,11 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
         bag_feats = feats.to(device)
         bag_label = label.to(device)   # [B, C] multi-hot
 
-        # if args.dropout_patch > 0:
-        #     selecy_window_indx = random.sample(range(10), int(args.dropout_patch * 10))
-        #     inteval = int(len(bag_feats) // 10)
-        #     for idx in selecy_window_indx:
-        #         bag_feats[:, idx * inteval:idx * inteval + inteval, :] = torch.randn(1, device=device)
+        if args.dropout_patch > 0:
+            selecy_window_indx = random.sample(range(10), int(args.dropout_patch * 10))
+            inteval = int(len(bag_feats) // 10)
+            for idx in selecy_window_indx:
+                bag_feats[:, idx * inteval:idx * inteval + inteval, :] = torch.randn(1, device=device)
 
         optimizer.zero_grad()
 
@@ -487,6 +511,7 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
                     tau=getattr(args, "proto_tau", 0.1),
                     sim_thresh=getattr(args, "proto_sim_thresh", 0.7),
                     win=getattr(args, "proto_win", 5),
+                    gauss_sigma=gauss_sigma
                 )
 
         # 최종 loss
@@ -542,7 +567,7 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
     return total_loss / max(1, n)
 
 
-def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 0.5, proto_bank=None, is_main=True):
+def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 0.5, proto_bank=None, is_main=True, gauss_sigma=None):
     if isinstance(milnet, nn.parallel.DistributedDataParallel):
         model = milnet.module
     else:
@@ -657,6 +682,7 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                         tau=getattr(args, "proto_tau", 0.1),
                         sim_thresh=getattr(args, "proto_sim_thresh", 0.7),
                         win=getattr(args, "proto_win", 5),
+                        gauss_sigma=gauss_sigma
                     )
 
             if args.datatype == "mixed" and (y_inst is not None):
@@ -838,10 +864,7 @@ def main():
     parser.add_argument('--dba_window', type=int, default=12000, help='Sliding window length (time steps) for DBA dataset')
     parser.add_argument('--dba_stride', type=int, default=6000, help='Sliding window stride for DBA dataset')
     parser.add_argument('--dba_test_ratio', type=float, default=0.2, help='Train/Test split ratio (sequence-level) for DBA dataset')
-    
-    parser.add_argument('--use_softclt_aux', action='store_true',
-                        help='Use SoftCLT (instance-wise + temporal) auxiliary losses instead of proto_inst_loss')
-    
+
     args = parser.parse_args()
 
     # ----- DDP setup -----
@@ -903,118 +926,19 @@ def main():
 
     criterion = nn.BCEWithLogitsLoss()
 
-    def _dataset_to_X_yidx(ds, device="cpu"):
-        """
-        loadorean()이 만든 Dataset에서 전체를 꺼내
-        X: [N, T, D] float tensor
-        y_idx: [N] long tensor (0..C-1)
-        로 변환합니다.
-
-        ds[i]가 (x, y) 또는 (x, y, ...) 형태여도 첫 2개만 사용합니다.
-        y가 one-hot이면 argmax로 idx를 만듭니다.
-        """
-        X_list = []
-        y_list = []
-
-        for i in range(len(ds)):
-            item = ds[i]
-            if isinstance(item, (tuple, list)):
-                x = item[0]
-                y = item[1]
-            else:
-                raise ValueError("Dataset item must be tuple/list like (x, y)")
-
-            # x: [T, D] or [D, T] 등 가능성이 있으면 여기서 정규화
-            # 현재 코드 흐름 상 loadorean은 보통 [T, D]를 준다고 가정합니다.
-            if not torch.is_tensor(x):
-                x = torch.tensor(x)
-            x = x.float()
-
-            if not torch.is_tensor(y):
-                y = torch.tensor(y)
-
-            # y가 one-hot([C]) 또는 scalar일 수 있음
-            if y.ndim > 0 and y.numel() > 1:
-                y_idx = int(torch.argmax(y).item())
-            else:
-                y_idx = int(y.item())
-
-            X_list.append(x)
-            y_list.append(y_idx)
-
-        X = torch.stack(X_list, dim=0).to(device)                 # [N, T, D]
-        y_idx = torch.tensor(y_list, dtype=torch.long, device=device)  # [N]
-        return X, y_idx
-
-    # # ---------------- 데이터 구성 ----------------
-    # if args.dataset in ['JapaneseVowels','SpokenArabicDigits','CharacterTrajectories','InsectWingbeat']:
-    #     trainset = loadorean(args, split='train')
-    #     testset = loadorean(args, split='test')
-
-    #     seq_len,num_classes,L_in=trainset.max_len,trainset.num_class,trainset.feat_in
-
-    #     if is_main:
-    #         print(f'max length {seq_len}')
-    #     args.feats_size = L_in
-    #     args.num_classes =  num_classes
-    #     if is_main:
-    #         print(f'num class:{args.num_classes}' )
+    # ---------------- 데이터 구성 ----------------
     if args.dataset in ['JapaneseVowels','SpokenArabicDigits','CharacterTrajectories','InsectWingbeat']:
-        train_base = loadorean(args, split='train')
-        test_base  = loadorean(args, split='test')
+        trainset = loadorean(args, split='train')
+        testset = loadorean(args, split='test')
 
-        base_T = train_base.max_len
-        num_classes = train_base.num_class
-        L_in = train_base.feat_in
+        seq_len,num_classes,L_in=trainset.max_len,trainset.num_class,trainset.feat_in
 
         if is_main:
-            print(f"[{args.dataset}] base max_len={base_T}, num_classes={num_classes}, feat_in={L_in}")
-
-        # 공통 args 갱신(입력 피처/클래스 수)
+            print(f'max length {seq_len}')
         args.feats_size = L_in
-        args.num_classes = num_classes
-
-        if args.datatype == "original":
-            # 기존대로 사용
-            trainset = train_base
-            testset  = test_base
-            seq_len  = base_T
-            args.seq_len = seq_len
-
-        elif args.datatype == "mixed":
-            # loadorean dataset -> (X, y_idx)로 변환 후 mixed bag으로 래핑
-            # 주의: mixed bag은 길이가 concat_k * T가 되므로 seq_len도 그에 맞춰야 합니다.
-            Xtr, ytr_idx = _dataset_to_X_yidx(train_base, device="cpu")
-            Xte, yte_idx = _dataset_to_X_yidx(test_base,  device="cpu")
-
-            concat_k = 2  # 원하시면 args로 빼셔도 됩니다(예: --concat_k)
-            trainset = MixedSyntheticBagsConcatK(
-                X=Xtr,
-                y_idx=ytr_idx,
-                num_classes=num_classes,
-                total_bags=len(Xtr),      # 필요시 더 크게(예: 5000)도 가능
-                concat_k=concat_k,
-                seed=args.seed,
-                return_instance_labels=False,
-            )
-            testset = MixedSyntheticBagsConcatK(
-                X=Xte,
-                y_idx=yte_idx,
-                num_classes=num_classes,
-                total_bags=len(Xte),
-                concat_k=concat_k,
-                seed=args.seed + 1,
-                return_instance_labels=True,   # mixed eval에서 inst acc 쓰려면 True
-            )
-
-            seq_len = concat_k * base_T
-            args.seq_len = seq_len
-
-            if is_main:
-                print(f"[{args.dataset}] mixed concat_k={concat_k} -> seq_len={seq_len}")
-
-        else:
-            raise ValueError(f"Unsupported datatype '{args.datatype}' for {args.dataset}")
+        args.num_classes =  num_classes
+        if is_main:
+            print(f'num class:{args.num_classes}' )
 
     elif args.dataset in ['PAMAP2']:
         trainset = loadorean(args, split='train')
@@ -1110,6 +1034,8 @@ def main():
         if is_main:
             print(f'num class: {args.num_classes}')
             print(f'total_len: {SYN_TOTAL_LEN}')
+    
+    gauss_sigma = None
 
     # ---------------- 모델 구성 ----------------
     if args.model =='TimeMIL':
@@ -1126,6 +1052,7 @@ def main():
             device=device,
             momentum=0.9,
         )
+        gauss_sigma = LearnableGaussianSigma(init_sigma=7.0).to(device)
     else:
         raise Exception("Model not available")
 
@@ -1140,8 +1067,12 @@ def main():
         milnet = base_model
 
     # ---------------- Optimizer ----------------
-    if  args.optimizer == 'adamw':
-        optimizer = torch.optim.AdamW(milnet.parameters(), lr=args.lr,  weight_decay=args.weight_decay)
+    params = list(milnet.parameters())
+    if gauss_sigma is not None:
+        params += list(gauss_sigma.parameters())
+
+    if args.optimizer == 'adamw':
+        optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
         optimizer = Lookahead(optimizer, alpha=0.5, k=5)
     elif args.optimizer == 'sgd':
         optimizer = torch.optim.SGD(milnet.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
@@ -1237,11 +1168,11 @@ def main():
         if isinstance(trainloader.sampler, DistributedSampler):
             trainloader.sampler.set_epoch(epoch)
 
-        train_loss_bag = train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=proto_bank, is_main=is_main, world_size=world_size)
+        train_loss_bag = train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_bank=proto_bank, is_main=is_main, world_size=world_size, gauss_sigma=gauss_sigma)
 
         # validation은 rank 0에서만 수행
         if is_main:
-            test_loss_bag, results = test(testloader, milnet, criterion, epoch, args, device, threshold=0.5, proto_bank=proto_bank, is_main=is_main)
+            test_loss_bag, results = test(testloader, milnet, criterion, epoch, args, device, threshold=0.5, proto_bank=proto_bank, is_main=is_main, gauss_sigma=gauss_sigma)
 
             if wandb.run is not None:
                 log_score = {
@@ -1259,6 +1190,8 @@ def main():
                     log_score["score/acc"] = results["bag_acc"]
                 if "inst_acc" in results:
                     log_score["score/inst_acc"] = results["inst_acc"]
+                if gauss_sigma is not None:
+                    log_score["param/gauss_sigma"] = gauss_sigma.sigma().item()
                 wandb.log(log_score, step=epoch)
 
             if logger is not None:

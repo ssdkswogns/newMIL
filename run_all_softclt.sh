@@ -1,5 +1,8 @@
 #!/bin/bash
 
+DIST_DIR=./dist_mats/mixed
+mkdir -p "$DIST_DIR"
+
 # 실행할 데이터셋 목록
 DATASETS=(
   "ArticularyWordRecognition"
@@ -28,7 +31,6 @@ DATASETS=(
   "StandWalkJump"
   "UWaveGestureLibrary"
   # "JapaneseVowels"
-  "dba"
 )
 
 # 반복 실행
@@ -38,7 +40,6 @@ DATASETS=(
 # done
 
 for dataset in "${DATASETS[@]}"; do
-    echo "Running TimeMIL on dataset: $dataset"
-    # CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29600 main_cl_fix.py --dataset $dataset --model AmbiguousMIL --datatype mixed --bag_loss_w 0.5 --inst_loss_w 0.2 --ortho_loss_w 0.0 --smooth_loss_w 0.05 --sparsity_loss_w 0.05 --proto_loss_w 0.2 --cls_contrast_w 0.1
-    CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 --master_port=29500 main_cl_exp_smooth.py --dataset $dataset --model AmbiguousMIL --datatype mixed --bag_loss_w 0.4 --inst_loss_w 0.4 --proto_loss_w 0.2 --epoch_des 20 --num_epochs 1500 --proto_win 30 --proto_tau 0.2
+  CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29600 \
+    main_cl_exp_softclt.py --dataset "$dataset" --model AmbiguousMIL --datatype mixed --use_softclt_aux --sim_mat_path "$DIST_DIR/soft_${dataset}_mixed_train.npz"  --epoch_des 20 --num_epochs 1500 --bag_loss_w 0.35 --inst_loss_w 0.35 --proto_loss_w 0.3
 done

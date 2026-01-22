@@ -43,6 +43,43 @@ torch.cuda.manual_seed_all(seed)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+def _dataset_to_X_yidx(ds):
+    """
+    loadorean() dataset에서 전체 샘플을 꺼내서
+    X: [N, T, D], y_idx: [N] 로 변환합니다.
+    ds[i]가 (x, y) 또는 (x, y, ...) 형태여도 첫 두 개만 사용합니다.
+    y가 one-hot이면 argmax로 idx 변환합니다.
+    """
+    X_list = []
+    y_list = []
+
+    for i in range(len(ds)):
+        item = ds[i]
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            raise ValueError(f"Unexpected dataset item at {i}: {type(item)}")
+
+        x, y = item[0], item[1]
+
+        if not torch.is_tensor(x):
+            x = torch.tensor(x)
+        x = x.float()
+
+        if not torch.is_tensor(y):
+            y = torch.tensor(y)
+
+        # y가 one-hot([C]) 또는 scalar일 수 있음
+        if y.ndim > 0 and y.numel() > 1:
+            y_idx = int(torch.argmax(y).item())
+        else:
+            y_idx = int(y.item())
+
+        X_list.append(x)
+        y_list.append(y_idx)
+
+    X = torch.stack(X_list, dim=0)  # [N, T, D]
+    y_idx = torch.tensor(y_list, dtype=torch.long)
+    return X, y_idx
+
 
 def evaluate_classification(testloader, milnet, criterion, args, class_names, threshold: float = 0.5):
     milnet.eval()
@@ -165,18 +202,47 @@ def build_datasets(args):
     Returns (testset, class_names, seq_len, num_classes, feat_dim)
     """
     if args.dataset in ['JapaneseVowels', 'SpokenArabicDigits', 'CharacterTrajectories', 'InsectWingbeat']:
-        trainset = loadorean(args, split='train')
-        testset = loadorean(args, split='test')
+        train_base = loadorean(args, split='train')
+        test_base  = loadorean(args, split='test')
 
-        seq_len, num_classes, L_in = trainset.max_len, trainset.num_class, trainset.feat_in
+        base_T, num_classes, L_in = train_base.max_len, train_base.num_class, train_base.feat_in
         args.feats_size = L_in
         args.num_classes = num_classes
 
-        if hasattr(trainset, 'class_names'):
-            class_names = list(trainset.class_names)
+        if hasattr(train_base, 'class_names'):
+            class_names = list(train_base.class_names)
         else:
             class_names = [str(i) for i in range(num_classes)]
-        return testset, class_names, seq_len, num_classes, L_in
+
+        if args.datatype == "original":
+            # 원본 dataset은 (x, y) 형태로만 나올 가능성이 큼 -> inst metric 불가
+            testset = test_base
+            seq_len = base_T
+            return testset, class_names, seq_len, num_classes, L_in
+
+        elif args.datatype == "mixed":
+            # loadorean -> (X, y_idx)로 변환 후 MixedSyntheticBagsConcatK 래핑
+            Xte, yte_idx = _dataset_to_X_yidx(test_base)
+
+            # mixed bag 길이 = concat_k * base_T
+            concat_k = 2  # 필요하면 args로 빼세요
+            seq_len = concat_k * base_T
+
+            testset = MixedSyntheticBagsConcatK(
+                X=Xte,
+                y_idx=yte_idx,
+                num_classes=num_classes,
+                total_bags=len(Xte),
+                concat_k=concat_k,
+                seed=args.seed + 1,
+                return_instance_labels=True
+            )
+
+            print(f"[{args.dataset}] mixed: base_T={base_T}, concat_k={concat_k}, seq_len={seq_len}")
+            return testset, class_names, seq_len, num_classes, L_in
+
+        else:
+            raise ValueError(f"Unsupported datatype '{args.datatype}' for {args.dataset}")
 
     Xtr, ytr, meta = load_classification(name=args.dataset, split='train', extract_path='./data')
     Xte, yte, _ = load_classification(name=args.dataset, split='test', extract_path='./data')
@@ -251,6 +317,8 @@ def main():
                         help='If set, skip bags with no positive labels instead of using argmax prediction')
     parser.add_argument('--cls_threshold', default=0.5, type=float, help='Threshold for multi-label classification metrics')
     parser.add_argument('--datatype', default="mixed", type=str, help='Choose datatype between original and mixed')
+    parser.add_argument('--use_softclt_aux', action='store_true',
+                    help='Use SoftCLT (instance-wise + temporal) auxiliary losses instead of proto_inst_loss')
 
     args = parser.parse_args()
     gpu_ids = tuple(args.gpu_index)
