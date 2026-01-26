@@ -22,12 +22,15 @@ from sklearn.metrics import (
     roc_auc_score,
     average_precision_score,
 )
+import torch.nn.functional as F
+from torch.utils.data import TensorDataset
 
 from aeon.datasets import load_classification
 from syntheticdataset import MixedSyntheticBagsConcatK
 from utils import *
 from mydataload import loadorean
-from models.timemil_old import TimeMIL, newTimeMIL
+from models.timemil import TimeMIL, originalTimeMIL
+# from models.timemil_old import TimeMIL, newTimeMIL
 from models.expmil import AmbiguousMILwithCL
 from compute_aopcr import compute_classwise_aopcr
 
@@ -83,6 +86,7 @@ def _dataset_to_X_yidx(ds):
 
 def evaluate_classification(testloader, milnet, criterion, args, class_names, threshold: float = 0.5):
     milnet.eval()
+    is_original = (args.datatype == "original")
     total_loss = 0.0
     all_labels: List[np.ndarray] = []
     all_probs: List[np.ndarray] = []
@@ -93,11 +97,16 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
     total_count = 0
 
     with torch.no_grad():
-        for batch_id, (feats, label, y_inst) in enumerate(testloader):
+        for batch_id, batch in enumerate(testloader):
+            if is_original:
+                feats, label = batch
+                y_inst = None
+            else:
+                feats, label, y_inst = batch
             bag_feats = feats.to(next(milnet.parameters()).device)
             bag_label = label.to(next(milnet.parameters()).device)
 
-            out = milnet(bag_feats)
+            out = milnet(bag_feats, warmup=False)
             if args.model == 'AmbiguousMIL':
                 if not isinstance(out, (tuple, list)) or len(out) < 6:
                     raise ValueError("Unexpected AmbiguousMIL output")
@@ -107,8 +116,10 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
                 if not isinstance(out, (tuple, list)) or len(out) < 4:
                     raise ValueError("Unexpected model output")
                 logits, _, _, attn_layer2 = out
-                attn_cls = attn_layer2[:, :, :C, C:]
-                attn_mean = attn_cls.mean(dim=1)
+                if args.datatype == "mixed":
+                    _, _, C = y_inst.shape
+                    attn_cls = attn_layer2[:, :, :C, C:]
+                    attn_mean = attn_cls.mean(dim=1)
                 instance_pred = None
 
             loss = criterion(logits, bag_label)
@@ -121,32 +132,33 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
             all_probs.append(probs)
             all_labels.append(label.cpu().numpy())
 
-            _, _, C = y_inst.shape
+            if not is_original:
+                _, _, C = y_inst.shape
 
-            if args.model == 'AmbiguousMIL' and instance_pred is not None:
-                pred_inst = torch.argmax(pred_inst, dim=2).cpu()
-            else:
-                pred_inst = torch.argmax(attn_mean, dim=1).cpu()
+                if args.model == 'AmbiguousMIL' and instance_pred is not None:
+                    pred_inst = torch.argmax(pred_inst, dim=2).cpu()
+                else:
+                    pred_inst = torch.argmax(attn_mean, dim=1).cpu()
 
-            y_inst_label = torch.argmax(y_inst, dim=2).cpu()
+                y_inst_label = torch.argmax(y_inst, dim=2).cpu()
 
-            correct = (pred_inst == y_inst_label).sum().item()
-            count = pred_inst.numel()
+                correct = (pred_inst == y_inst_label).sum().item()
+                count = pred_inst.numel()
 
-            total_correct += correct
-            total_count += count
+                total_correct += correct
+                total_count += count
 
-            if per_class_correct is None:
-                per_class_correct = torch.zeros(C, dtype=torch.long)
-                per_class_total = torch.zeros(C, dtype=torch.long)
+                if per_class_correct is None:
+                    per_class_correct = torch.zeros(C, dtype=torch.long)
+                    per_class_total = torch.zeros(C, dtype=torch.long)
 
-            pb = pred_inst.view(-1)
-            tb = y_inst_label.view(-1)
-            for c_id in range(C):
-                mask = (tb == c_id)
-                if mask.any():
-                    per_class_correct[c_id] += (pb[mask] == tb[mask]).sum().cpu()
-                    per_class_total[c_id] += mask.sum().cpu()
+                pb = pred_inst.view(-1)
+                tb = y_inst_label.view(-1)
+                for c_id in range(C):
+                    mask = (tb == c_id)
+                    if mask.any():
+                        per_class_correct[c_id] += (pb[mask] == tb[mask]).sum().cpu()
+                        per_class_total[c_id] += mask.sum().cpu()
 
             sys.stdout.write('\r Testing bag [%d/%d] bag loss: %.4f'
                              % (batch_id, len(testloader), loss.item()))
@@ -173,19 +185,25 @@ def evaluate_classification(testloader, milnet, criterion, args, class_names, th
     roc_macro = float(np.mean(roc_list)) if roc_list else 0.0
     ap_macro = float(np.mean(ap_list)) if ap_list else 0.0
 
-    timestep_acc = float(total_correct / total_count) if total_count > 0 else 0.0
-    per_class_acc = []
-    for c_id in range(per_class_total.numel()):
-        tot = int(per_class_total[c_id].item())
-        cor = int(per_class_correct[c_id].item())
-        acc = float(cor / tot) if tot > 0 else 0.0
-        label = class_names[c_id] if (class_names is not None and c_id < len(class_names)) else f"class-{c_id}"
-        per_class_acc.append({"class_id": c_id, "label": label, "count": tot, "correct": cor, "acc": acc})
+    if is_original:
+        inst_acc = None
+    else:
+        timestep_acc = float(total_correct / total_count) if total_count > 0 else 0.0
+        per_class_acc = []
+        for c_id in range(per_class_total.numel()):
+            tot = int(per_class_total[c_id].item())
+            cor = int(per_class_correct[c_id].item())
+            acc = float(cor / tot) if tot > 0 else 0.0
+            label = class_names[c_id] if (class_names is not None and c_id < len(class_names)) else f"class-{c_id}"
+            per_class_acc.append({
+                "class_id": c_id, "label": label,
+                "count": tot, "correct": cor, "acc": acc
+            })
 
-    inst_acc = {
-        "timestep_accuracy_overall": timestep_acc,
-        "per_class": per_class_acc
-    }
+        inst_acc = {
+            "timestep_accuracy_overall": timestep_acc,
+            "per_class": per_class_acc
+        }
 
     results: Dict[str, float] = {
         "f1_micro": f1_micro, "f1_macro": f1_macro,
@@ -263,15 +281,18 @@ def build_datasets(args):
         yte_idx = torch.tensor(yte, dtype=torch.long)
 
     L_in = Xtr.shape[-1]
-    seq_len = max(21, Xte.shape[1])
+    seq_len = Xte.shape[1]
+    # seq_len = max(21, Xte.shape[1])
     args.feats_size = L_in
-
-    testset = MixedSyntheticBagsConcatK(
-        X=Xte, y_idx=yte_idx, num_classes=num_classes,
-        total_bags=len(Xte),
-        seed=args.seed + 1,
-        return_instance_labels=True
-    )
+    if args.datatype == "original":
+        testset  = TensorDataset(Xte, F.one_hot(yte_idx, num_classes=num_classes).float())
+    elif args.datatype == "mixed":
+        testset = MixedSyntheticBagsConcatK(
+            X=Xte, y_idx=yte_idx, num_classes=num_classes,
+            total_bags=len(Xte),
+            seed=args.seed + 1,
+            return_instance_labels=True
+        )
 
     print(f'num class: {args.num_classes}')
     print(f'total_len: {seq_len}')
@@ -280,12 +301,9 @@ def build_datasets(args):
 
 def build_model(args, seq_len, num_classes, device):
     if args.model == 'TimeMIL':
-        milnet = TimeMIL(args.feats_size, mDim=args.embed,
-                         n_classes=num_classes,
-                         dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
-                         max_seq_len=seq_len, is_instance=True).to(device)
+        milnet = originalTimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len, is_instance=True).to(device)
     elif args.model == 'newTimeMIL':
-        milnet = newTimeMIL(args.feats_size, mDim=args.embed,
+        milnet = TimeMIL(args.feats_size, mDim=args.embed,
                             n_classes=num_classes,
                             dropout=args.dropout_node if hasattr(args, 'dropout_node') else 0.0,
                             max_seq_len=seq_len, is_instance=True).to(device)
@@ -336,9 +354,26 @@ def main():
     testset, class_names, seq_len, num_classes, feat_dim = build_datasets(args)
     milnet = build_model(args, seq_len, num_classes, device)
 
+    if args.dataset in ['DuckDuckGeese','PenDigits','FingerMovements','ERing','EigenWorms','HandMovementDirection','RacketSports','UWaveGestureLibrary']:
+        batch = 64
+    elif args.dataset in ['Heartbeat']:
+        batch = 32
+    elif args.dataset in ['EthanolConcentration','NATOPS','JapaneseVowels','MotorImagery','SelfRegulationSCP1']:
+        batch = 16
+    elif args.dataset in ['PEMS-SF','SelfRegulationSCP2','AtrialFibrillation','Cricket']:
+        batch = 8
+    elif args.dataset in ['StandWalkJump']:
+        batch = 1
+    elif args.dataset in ['Libras','Handwriting','Epilepsy']:
+        batch = 128
+    elif args.dataset in ['FaceDetection','LSST','ArticularyWordRecognition','BasicMotions','PhonemeSpectra']:
+        batch = 512
+    else:
+        batch = args.batchsize
+
     # DataLoader
     testloader = DataLoader(
-        testset, batch_size=1, shuffle=False,
+        testset, batch_size=batch, shuffle=False,
         num_workers=args.num_workers, drop_last=False, pin_memory=True
     )
 
@@ -354,7 +389,8 @@ def main():
         testloader, milnet, criterion, args, class_names, threshold=args.cls_threshold
     )
     print("\nClassification metrics:", cls_results)
-    print("Instance accuracy:", inst_acc)
+    if inst_acc is not None:
+        print("Instance accuracy:", inst_acc)
 
     # AOPCR
     print("Computing class-wise AOPCR ...")

@@ -145,7 +145,7 @@ def compute_classwise_aopcr(
             instance_logits = weighted_instance_pred
         elif args.model == 'TimeMIL':
             out = milnet(x)
-            logits, attn_layer1, attn_layer2 = out
+            logits, x_cls, attn_layer1, attn_layer2 = out
             prob = torch.sigmoid(logits)
             instance_logits = None
         elif args.model == 'newTimeMIL':
@@ -192,6 +192,19 @@ def compute_classwise_aopcr(
                     )[b]                                                # [T]
 
                 scores = scores.detach()
+
+                # scores 길이가 입력 T와 다를 수 있음 (모델 내부 처리로 인해)
+                T_scores = scores.size(0)
+                if T_scores != T:
+                    # 길이가 다르면 interpolate하거나 truncate
+                    if T_scores < T:
+                        # scores를 T 길이로 보간
+                        scores = torch.nn.functional.interpolate(
+                            scores.view(1, 1, -1), size=T, mode='linear', align_corners=False
+                        ).view(-1)
+                    else:
+                        # scores를 T 길이로 자름
+                        scores = scores[:T]
 
                 # 중요도 큰 순으로 정렬된 timestep index
                 sorted_idx = torch.argsort(scores, dim=0, descending=True)  # [T]

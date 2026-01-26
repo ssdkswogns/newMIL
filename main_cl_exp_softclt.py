@@ -2,6 +2,8 @@
 
 from html import parser
 import torch
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.data import TensorDataset
@@ -10,7 +12,11 @@ from torch.autograd import Variable
 import torchvision.transforms.functional as VF
 from torchvision import transforms
 
-import sys, argparse, os, copy, itertools, glob, datetime
+import sys, argparse, os, copy, itertools, glob, datetime, time
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import pandas as pd
 import numpy as np
 #from tqdm import tqdm
@@ -53,6 +59,117 @@ from sklearn.preprocessing import MinMaxScaler
 from tslearn.metrics import dtw, dtw_path, gak
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
 
+def get_MDTW_blockwise_memmap(
+    MTS_tr,
+    memmap_path: str,
+    block_size: int = 256,
+    resume: bool = True,
+    checkpoint_path: str = None,
+    verbose: bool = True,
+):
+    """
+    MTS_tr: list of np arrays, each [T, D] float32
+    dist_mat를 (N,N) memmap으로 디스크에 생성/재사용하며
+    블록 단위로 DTW를 계산해 채웁니다.
+
+    - resume=True: 이미 계산된 블록은 스킵 (checkpoint 기반)
+    - checkpoint: 계산된 row-block index를 저장 (간단/안정)
+    """
+    N = len(MTS_tr)
+    os.makedirs(os.path.dirname(os.path.abspath(memmap_path)), exist_ok=True)
+
+    if checkpoint_path is None:
+        checkpoint_path = memmap_path + ".ckpt.npy"
+
+    # memmap 생성/로드
+    if os.path.exists(memmap_path):
+        dist_mm = np.memmap(memmap_path, dtype=np.float32, mode="r+", shape=(N, N))
+    else:
+        dist_mm = np.memmap(memmap_path, dtype=np.float32, mode="w+", shape=(N, N))
+        # 초기값: diag=0, 나머지=-1 (미계산 마킹)
+        dist_mm[:] = -1.0
+        np.fill_diagonal(dist_mm, 0.0)
+        dist_mm.flush()
+
+    # checkpoint 로드
+    done_blocks = set()
+    if resume and os.path.exists(checkpoint_path):
+        done = np.load(checkpoint_path, allow_pickle=True).tolist()
+        done_blocks = set(done) if isinstance(done, list) else set()
+
+    n_blocks = math.ceil(N / block_size)
+
+    def save_ckpt():
+        np.save(checkpoint_path, sorted(list(done_blocks)))
+
+    t0 = time.time()
+    for bi in range(n_blocks):
+        if resume and (bi in done_blocks):
+            continue
+
+        i0 = bi * block_size
+        i1 = min(N, (bi + 1) * block_size)
+
+        if verbose:
+            print(f"[DTW] block {bi+1}/{n_blocks} rows [{i0}:{i1})  elapsed={time.time()-t0:.1f}s", flush=True)
+
+        # j-block은 0..bi까지만 (하삼각)
+        for bj in range(bi + 1):
+            j0 = bj * block_size
+            j1 = min(N, (bj + 1) * block_size)
+
+            # 블록 내부 채우기
+            for i in range(i0, i1):
+                # 대칭/중복 방지: j는 <= i
+                j_max = min(j1, i + 1) if bj == bi else j1
+                for j in range(j0, j_max):
+                    if i == j:
+                        continue
+                    # resume 시 이미 값이 있으면 스킵
+                    if resume and dist_mm[i, j] >= 0:
+                        continue
+                    d = dtw(MTS_tr[i], MTS_tr[j])
+                    dist_mm[i, j] = d
+                    dist_mm[j, i] = d  # 대칭 채우기
+
+        dist_mm.flush()
+        done_blocks.add(bi)
+        save_ckpt()
+
+    return dist_mm  # memmap handle
+
+def global_minmax_offdiag(dist_mm, block=1024):
+    N = dist_mm.shape[0]
+    gmin = np.inf
+    gmax = -np.inf
+    for i0 in range(0, N, block):
+        i1 = min(N, i0 + block)
+        chunk = np.array(dist_mm[i0:i1, :], copy=False)  # view 가능
+        # 대각 제외: i0..i1 구간의 diag 위치만 마스킹
+        for ii in range(i0, i1):
+            chunk[ii - i0, ii] = np.nan
+        cmin = np.nanmin(chunk)
+        cmax = np.nanmax(chunk)
+        gmin = min(gmin, cmin)
+        gmax = max(gmax, cmax)
+    return gmin, gmax
+
+
+def _atomic_save_npz(out_path: str, **kwargs):
+    _ensure_parent_dir(out_path)
+    tmp_path = out_path + ".tmp"
+    np.savez_compressed(tmp_path, **kwargs)
+    os.replace(tmp_path, out_path)  # atomic (same filesystem)
+
+def _wait_for_file(done_path: str, timeout_sec: int = 24*3600, poll_sec: float = 2.0):
+    t0 = time.time()
+    while True:
+        if os.path.exists(done_path):
+            return
+        if time.time() - t0 > timeout_sec:
+            raise TimeoutError(f"[SoftCLT] Timed out waiting for: {done_path}")
+        time.sleep(poll_sec)
+
 def prepare_softclt_sim_matrix(
     sim_mat_path: str,
     trainset,
@@ -62,15 +179,20 @@ def prepare_softclt_sim_matrix(
 ):
     """
     sim_mat_path가 없으면 trainset으로 soft similarity matrix를 생성.
-    DDP 환경에서는 rank 0만 생성하고 barrier로 동기화.
+    DDP 환경에서 rank 0만 생성.
+    다른 rank들은 dist.barrier() 대신 파일 생성 완료(done flag)까지 폴링.
     """
+    # done_flag = sim_mat_path + ".done"
+
     if os.path.exists(sim_mat_path):
         if is_main:
             print(f"[SoftCLT] Found existing sim matrix: {sim_mat_path}")
     else:
         if is_main:
             print(f"[SoftCLT] sim matrix not found. Building: {sim_mat_path}")
-            build_softclt_soft_matrix_from_dataset(
+
+            # ---- 여기서 생성 ----
+            soft_mat = build_softclt_soft_matrix_from_dataset(
                 trainset,
                 type_=args.dist_metric,
                 min_=args.dist_min,
@@ -78,13 +200,28 @@ def prepare_softclt_sim_matrix(
                 multivariate=True,
                 densify_tau=args.densify_tau,
                 densify_alpha=args.densify_alpha,
-                out_path=sim_mat_path,
+                out_path=None,  # 아래에서 atomic 저장으로 처리
             )
-        # 다른 rank들은 기다림
-        if world_size > 1 and dist.is_initialized():
-            dist.barrier()
 
-    # 로드
+            # atomic save + done flag
+            _atomic_save_npz(
+                sim_mat_path,
+                soft_matrix=soft_mat,
+                metric=args.dist_metric,
+                multivariate=True,
+                min_=args.dist_min,
+                max_=args.dist_max,
+                densify_tau=args.densify_tau,
+                densify_alpha=args.densify_alpha
+            )
+            with open(done_flag, "w") as f:
+                f.write("ok\n")
+
+        else:
+            # rank0가 저장을 끝낼 때까지 폴링
+            _wait_for_file(done_flag, timeout_sec=24*3600, poll_sec=2.0)
+
+    # ---- 로드 ----
     npz = np.load(sim_mat_path)
     if "soft_matrix" in npz:
         mat = npz["soft_matrix"]
@@ -290,30 +427,288 @@ def convert_hard_matrix(soft_matrix, pos_ratio):
     num_pos = int((N - 1) * pos_ratio)
     return topK_one_else_zero(soft_matrix, num_pos)
 
-def build_softclt_soft_matrix_from_dataset(dataset, type_='DTW', min_=0.0, max_=1.0,
-                                           multivariate=True,
-                                           densify_tau=None, densify_alpha=None,
-                                           out_path=None):
-    """
-    dataset -> X_tr(list) -> save_sim_mat -> (optional) densify -> 저장
-    multivariate=True이면 feats를 [T,D]로 만들어 MDTW(dist) 계산
-    """
-    N = len(dataset)
+# ---------------------------
+# CPU 폭주 방지 (선택 권장)
+# ---------------------------
+def limit_cpu_threads(n: int = 1):
+    os.environ.setdefault("OMP_NUM_THREADS", str(n))
+    os.environ.setdefault("MKL_NUM_THREADS", str(n))
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(n))
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", str(n))
 
+def _sanitize_np(x: np.ndarray) -> np.ndarray:
+    # dtw에 NaN/Inf가 들어가면 터질 수 있으므로 방어
+    x = np.asarray(x)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    x = x.astype(np.float32, copy=False)
+    return np.ascontiguousarray(x)
+
+def _to_tslearn_mts_safe(feats):
+    mts = _to_tslearn_mts(feats)  # 기존 사용
+    return _sanitize_np(mts)
+
+def _to_tslearn_univar_safe(feats):
+    uts = _to_tslearn_univar(feats)  # 기존 사용
+    return _sanitize_np(uts)
+
+def _ensure_parent_dir(filepath: str):
+    parent = os.path.dirname(os.path.abspath(filepath))
+    if parent and (not os.path.exists(parent)):
+        os.makedirs(parent, exist_ok=True)
+
+def _make_memmap(path: str, shape, mode="w+"):
+    _ensure_parent_dir(path)
+    return np.memmap(path, dtype=np.float32, mode=mode, shape=shape)
+
+def get_MDTW_blockwise_memmap(
+    X_list,                       # list of [T,D] float32
+    dist_memmap_path: str,
+    block_size: int = 128,
+    resume: bool = True,
+    ckpt_path: str = None,
+    verbose: bool = True,
+):
+    """
+    DTW 거리행렬 NxN을 memmap(디스크)로 만들고 블록 단위로 채움.
+    - 계산법(DTW) 동일
+    - RAM 사용량 최소화
+    - 중간에 죽어도 resume 가능
+    """
+    N = len(X_list)
+    if ckpt_path is None:
+        ckpt_path = dist_memmap_path + ".ckpt.npy"
+
+    # dist memmap 생성/로드
+    if os.path.exists(dist_memmap_path):
+        dist_mm = _make_memmap(dist_memmap_path, (N, N), mode="r+")
+    else:
+        dist_mm = _make_memmap(dist_memmap_path, (N, N), mode="w+")
+        dist_mm[:] = -1.0
+        np.fill_diagonal(dist_mm, 0.0)
+        dist_mm.flush()
+
+    done_blocks = set()
+    if resume and os.path.exists(ckpt_path):
+        done = np.load(ckpt_path, allow_pickle=True).tolist()
+        if isinstance(done, list):
+            done_blocks = set(done)
+
+    n_blocks = math.ceil(N / block_size)
+    t0 = time.time()
+
+    def save_ckpt():
+        np.save(ckpt_path, sorted(list(done_blocks)))
+
+    for bi in range(n_blocks):
+        if resume and (bi in done_blocks):
+            continue
+
+        i0 = bi * block_size
+        i1 = min(N, (bi + 1) * block_size)
+
+        if verbose:
+            print(f"[DTW] block {bi+1}/{n_blocks} rows [{i0}:{i1})  elapsed={time.time()-t0:.1f}s", flush=True)
+
+        # 하삼각만 계산: bj <= bi
+        for bj in range(bi + 1):
+            j0 = bj * block_size
+            j1 = min(N, (bj + 1) * block_size)
+
+            for i in range(i0, i1):
+                j_max = min(j1, i + 1) if bj == bi else j1
+                for j in range(j0, j_max):
+                    if i == j:
+                        continue
+                    # 이미 계산했으면 스킵
+                    if resume and dist_mm[i, j] >= 0:
+                        continue
+                    try:
+                        d = dtw(X_list[i], X_list[j])
+                    except Exception:
+                        # 한 쌍 때문에 전체가 죽지 않도록 매우 큰 거리로 대체
+                        d = 1e6
+                    dist_mm[i, j] = d
+                    dist_mm[j, i] = d  # 대칭
+
+        dist_mm.flush()
+        done_blocks.add(bi)
+        save_ckpt()
+
+    return dist_mm
+
+def _rowwise_offdiag_min(dist_mm, block_size: int = 1024) -> np.ndarray:
+    """
+    각 row i에 대해 min_{j!=i} dist[i,j]를 구함. (diag 제외)
+    dist_mm은 memmap이어도 동작.
+    """
+    N = dist_mm.shape[0]
+    row_min = np.full((N,), np.inf, dtype=np.float32)
+    for i0 in range(0, N, block_size):
+        i1 = min(N, i0 + block_size)
+        chunk = np.array(dist_mm[i0:i1, :], copy=False)  # view 가능
+        # diag 제외: chunk 내부에서 해당 위치만 inf 처리
+        for ii in range(i0, i1):
+            chunk[ii - i0, ii] = np.inf
+        row_min[i0:i1] = np.min(chunk, axis=1).astype(np.float32)
+    return row_min
+
+def _global_minmax(dist_mm, block_size: int = 1024):
+    """
+    전체 행렬의 min/max(대각 포함)를 구하되,
+    여기서는 diag를 이미 row_min으로 바꾼 뒤 사용할 것을 권장.
+    """
+    N = dist_mm.shape[0]
+    gmin = np.inf
+    gmax = -np.inf
+    for i0 in range(0, N, block_size):
+        i1 = min(N, i0 + block_size)
+        chunk = np.array(dist_mm[i0:i1, :], copy=False)
+        cmin = float(np.min(chunk))
+        cmax = float(np.max(chunk))
+        gmin = min(gmin, cmin)
+        gmax = max(gmax, cmax)
+    return gmin, gmax
+
+def _write_soft_matrix_from_dist_memmap(
+    dist_mm,
+    out_soft_memmap_path: str,
+    min_: float,
+    max_: float,
+    block_size: int = 1024,
+    verbose: bool = True,
+):
+    """
+    SoftCLT 원본 로직 유지:
+      1) diag = row offdiag min
+      2) MinMaxScaler(feature_range=(min_, max_)) == affine scaling
+      3) sim = 1 - dist_norm
+    단, RAM 폭발 방지를 위해 블록 처리 + memmap 저장
+    """
+    N = dist_mm.shape[0]
+
+    # (1) diag 보정: d_ii <- min_{j!=i} d_ij
+    if verbose:
+        print("[SoftCLT] computing row-wise off-diagonal minima for diag fill ...", flush=True)
+    row_min = _rowwise_offdiag_min(dist_mm, block_size=block_size)
+
+    if verbose:
+        print("[SoftCLT] filling diagonal with row minima ...", flush=True)
+    for i0 in range(0, N, block_size):
+        i1 = min(N, i0 + block_size)
+        # diag만 블록으로 채움
+        for ii in range(i0, i1):
+            dist_mm[ii, ii] = row_min[ii]
+    dist_mm.flush()
+
+    # (2) global min/max (feature_range scaling을 위한)
+    if verbose:
+        print("[SoftCLT] computing global min/max ...", flush=True)
+    dmin, dmax = _global_minmax(dist_mm, block_size=block_size)
+    denom = (dmax - dmin) if (dmax > dmin) else 1.0
+
+    # MinMaxScaler(feature_range=(min_, max_))와 동일:
+    # scaled = (x - dmin)/denom * (max_-min_) + min_
+    a = (max_ - min_) / denom
+    b = min_ - dmin * a
+
+    # (3) dist_norm -> sim (1 - dist_norm) 을 soft memmap에 작성
+    soft_mm = _make_memmap(out_soft_memmap_path, (N, N), mode="w+")
+    if verbose:
+        print("[SoftCLT] writing normalized similarity matrix (streaming) ...", flush=True)
+
+    for i0 in range(0, N, block_size):
+        i1 = min(N, i0 + block_size)
+        chunk = np.array(dist_mm[i0:i1, :], copy=False).astype(np.float32, copy=False)
+        dist_norm = chunk * a + b
+        sim = (1.0 - dist_norm).astype(np.float32)
+        soft_mm[i0:i1, :] = sim
+        soft_mm.flush()
+
+    return soft_mm  # memmap handle
+
+def build_softclt_soft_matrix_from_dataset(
+    dataset,
+    type_='DTW',
+    min_=0.0,
+    max_=1.0,
+    multivariate=True,
+    densify_tau=None,
+    densify_alpha=None,
+    out_path=None,
+    # --- 추가 옵션(안정화) ---
+    dtw_block_size: int = 128,
+    norm_block_size: int = 1024,
+    resume: bool = True,
+    tmp_dir: str = "./softclt_cache",
+    cpu_threads: int = 1,
+    verbose: bool = True,
+):
+    """
+    기존 계산법 유지:
+      dataset -> X(list) -> (DTW NxN dist) -> diag fill -> MinMax -> sim=1-dist -> (optional) densify -> npz 저장
+
+    변경점:
+      - DTW 거리행렬을 memmap으로 블록 계산(디스크 저장)
+      - 정규화/유사도 생성도 블록 스트리밍(memmap)
+      - densify는 마지막에 필요 시 RAM으로 올려 처리(여전히 NxN이므로 매우 크면 부담)
+    """
+    if type_ != 'DTW':
+        raise ValueError("현재 버전은 계산법 유지를 위해 DTW만 지원하도록 구성했습니다.")
+    if not multivariate:
+        raise ValueError("요청하신 '현재 계산법 유지' 기준에서 large dataset 문제는 multivariate DTW가 핵심이라 여기서는 multivariate=True만 다룹니다.")
+
+    limit_cpu_threads(cpu_threads)
+
+    N = len(dataset)
+    if verbose:
+        print(f"[SoftCLT] N={N}  multivariate={multivariate}  metric={type_}", flush=True)
+
+    # 1) X 만들기 (기존과 동일)
     X = []
     for i in range(N):
         item = dataset[i]
         feats = item[0]
         if multivariate:
-            X.append(_to_tslearn_mts(feats))       # [T,D]
+            X.append(_to_tslearn_mts_safe(feats))      # [T,D]
         else:
-            X.append(_to_tslearn_univar(feats))    # [T,1]
+            X.append(_to_tslearn_univar_safe(feats))   # [T,1]
 
-    soft_mat = save_sim_mat(X, min_=min_, max_=max_, multivariate=multivariate, type_=type_)
+    # 2) dist memmap 경로
+    _ensure_parent_dir(tmp_dir + "/dummy")
+    dist_memmap_path = os.path.join(tmp_dir, f"dist_{type_}_N{N}.mmap")
+    soft_memmap_path = os.path.join(tmp_dir, f"soft_{type_}_N{N}.mmap")
 
+    # 3) DTW 거리행렬 계산(블록/재개 가능)
+    dist_mm = get_MDTW_blockwise_memmap(
+        X,
+        dist_memmap_path=dist_memmap_path,
+        block_size=dtw_block_size,
+        resume=resume,
+        verbose=verbose,
+    )
+
+    # 4) dist -> soft(similarity) memmap 생성(원본 로직 유지, 스트리밍)
+    soft_mm = _write_soft_matrix_from_dist_memmap(
+        dist_mm,
+        out_soft_memmap_path=soft_memmap_path,
+        min_=min_,
+        max_=max_,
+        block_size=norm_block_size,
+        verbose=verbose,
+    )
+
+    # 5) densify (원본과 동일)  ※주의: 여기서 NxN을 RAM으로 올립니다.
     if densify_tau is not None and densify_alpha is not None:
+        if verbose:
+            print("[SoftCLT] densify enabled (will materialize NxN in RAM) ...", flush=True)
+        soft_mat = np.array(soft_mm, copy=True)  # RAM
         soft_mat = densify(soft_mat, densify_tau, densify_alpha).astype(np.float32)
+    else:
+        # npz 저장을 위해서는 결국 RAM array가 필요합니다.
+        # (np.savez_compressed는 memmap을 직접 효율적으로 압축 저장하지 못합니다.)
+        soft_mat = np.array(soft_mm, copy=True)
 
+    # 6) 저장 (기존과 동일)
     if out_path is not None:
         _ensure_parent_dir(out_path)
         np.savez_compressed(
@@ -329,6 +724,46 @@ def build_softclt_soft_matrix_from_dataset(dataset, type_='DTW', min_=0.0, max_=
         print(f"[dist_mat] saved soft_matrix: {out_path}  shape={soft_mat.shape}")
 
     return soft_mat
+
+# def build_softclt_soft_matrix_from_dataset(dataset, type_='DTW', min_=0.0, max_=1.0,
+#                                            multivariate=True,
+#                                            densify_tau=None, densify_alpha=None,
+#                                            out_path=None):
+#     """
+#     dataset -> X_tr(list) -> save_sim_mat -> (optional) densify -> 저장
+#     multivariate=True이면 feats를 [T,D]로 만들어 MDTW(dist) 계산
+#     """
+#     N = len(dataset)
+
+#     X = []
+#     for i in range(N):
+#         item = dataset[i]
+#         feats = item[0]
+#         if multivariate:
+#             X.append(_to_tslearn_mts(feats))       # [T,D]
+#         else:
+#             X.append(_to_tslearn_univar(feats))    # [T,1]
+
+#     soft_mat = save_sim_mat(X, min_=min_, max_=max_, multivariate=multivariate, type_=type_)
+
+#     if densify_tau is not None and densify_alpha is not None:
+#         soft_mat = densify(soft_mat, densify_tau, densify_alpha).astype(np.float32)
+
+#     if out_path is not None:
+#         _ensure_parent_dir(out_path)
+#         np.savez_compressed(
+#             out_path,
+#             soft_matrix=soft_mat,
+#             metric=type_,
+#             multivariate=multivariate,
+#             min_=min_,
+#             max_=max_,
+#             densify_tau=densify_tau,
+#             densify_alpha=densify_alpha
+#         )
+#         print(f"[dist_mat] saved soft_matrix: {out_path}  shape={soft_mat.shape}")
+
+#     return soft_mat
 
 # ----- DDP utils -----
 def setup_distributed():
@@ -1178,19 +1613,106 @@ def main():
 
     criterion = nn.BCEWithLogitsLoss()
 
+    def _dataset_to_X_yidx(ds, device="cpu"):
+        """
+        loadorean()이 만든 Dataset에서 전체를 꺼내
+        X: [N, T, D] float tensor
+        y_idx: [N] long tensor (0..C-1)
+        로 변환합니다.
+
+        ds[i]가 (x, y) 또는 (x, y, ...) 형태여도 첫 2개만 사용합니다.
+        y가 one-hot이면 argmax로 idx를 만듭니다.
+        """
+        X_list = []
+        y_list = []
+
+        for i in range(len(ds)):
+            item = ds[i]
+            if isinstance(item, (tuple, list)):
+                x = item[0]
+                y = item[1]
+            else:
+                raise ValueError("Dataset item must be tuple/list like (x, y)")
+
+            # x: [T, D] or [D, T] 등 가능성이 있으면 여기서 정규화
+            # 현재 코드 흐름 상 loadorean은 보통 [T, D]를 준다고 가정합니다.
+            if not torch.is_tensor(x):
+                x = torch.tensor(x)
+            x = x.float()
+
+            if not torch.is_tensor(y):
+                y = torch.tensor(y)
+
+            # y가 one-hot([C]) 또는 scalar일 수 있음
+            if y.ndim > 0 and y.numel() > 1:
+                y_idx = int(torch.argmax(y).item())
+            else:
+                y_idx = int(y.item())
+
+            X_list.append(x)
+            y_list.append(y_idx)
+
+        X = torch.stack(X_list, dim=0).to(device)                 # [N, T, D]
+        y_idx = torch.tensor(y_list, dtype=torch.long, device=device)  # [N]
+        return X, y_idx
+
     # ---------------- 데이터 구성 ----------------
     if args.dataset in ['JapaneseVowels','SpokenArabicDigits','CharacterTrajectories','InsectWingbeat']:
-        trainset = loadorean(args, split='train')
-        testset = loadorean(args, split='test')
+        train_base = loadorean(args, split='train')
+        test_base  = loadorean(args, split='test')
 
-        seq_len,num_classes,L_in=trainset.max_len,trainset.num_class,trainset.feat_in
+        base_T = train_base.max_len
+        num_classes = train_base.num_class
+        L_in = train_base.feat_in
 
         if is_main:
-            print(f'max length {seq_len}')
+            print(f"[{args.dataset}] base max_len={base_T}, num_classes={num_classes}, feat_in={L_in}")
+
+        # 공통 args 갱신(입력 피처/클래스 수)
         args.feats_size = L_in
-        args.num_classes =  num_classes
-        if is_main:
-            print(f'num class:{args.num_classes}' )
+        args.num_classes = num_classes
+
+        if args.datatype == "original":
+            # 기존대로 사용
+            trainset = train_base
+            testset  = test_base
+            seq_len  = base_T
+            args.seq_len = seq_len
+
+        elif args.datatype == "mixed":
+            # loadorean dataset -> (X, y_idx)로 변환 후 mixed bag으로 래핑
+            # 주의: mixed bag은 길이가 concat_k * T가 되므로 seq_len도 그에 맞춰야 합니다.
+            Xtr, ytr_idx = _dataset_to_X_yidx(train_base, device="cpu")
+            Xte, yte_idx = _dataset_to_X_yidx(test_base,  device="cpu")
+
+            concat_k = 2  # 원하시면 args로 빼셔도 됩니다(예: --concat_k)
+            trainset = MixedSyntheticBagsConcatK(
+                X=Xtr,
+                y_idx=ytr_idx,
+                num_classes=num_classes,
+                total_bags=len(Xtr),      # 필요시 더 크게(예: 5000)도 가능
+                concat_k=concat_k,
+                seed=args.seed,
+                return_instance_labels=False,
+            )
+            testset = MixedSyntheticBagsConcatK(
+                X=Xte,
+                y_idx=yte_idx,
+                num_classes=num_classes,
+                total_bags=len(Xte),
+                concat_k=concat_k,
+                seed=args.seed + 1,
+                return_instance_labels=True,   # mixed eval에서 inst acc 쓰려면 True
+            )
+
+            seq_len = concat_k * base_T
+            args.seq_len = seq_len
+
+            if is_main:
+                print(f"[{args.dataset}] mixed concat_k={concat_k} -> seq_len={seq_len}")
+
+        else:
+            raise ValueError(f"Unsupported datatype '{args.datatype}' for {args.dataset}")
 
     elif args.dataset in ['PAMAP2']:
         trainset = loadorean(args, split='train')

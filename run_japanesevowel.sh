@@ -30,3 +30,13 @@ for loss in "${LOSSES[@]}"; do
         --proto_win 30 \
         --proto_tau 0.2
 done
+
+    CUDA_VISIBLE_DEVICES=2,3 torchrun \
+        --nproc_per_node=2 \
+        --master_port=29500 \
+        main_cl_exp.py \
+        --dataset JapaneseVowels \
+        --model newTimeMIL \
+        --datatype mixed \
+        --epoch_des 20 \
+        --num_epochs 1500 \

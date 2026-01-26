@@ -232,10 +232,13 @@ def save_gt_pred_plot(
         ax1.set_yticks([]); ax1.set_xticks([])
         ax1.set_title("GT inst label (argmax)")
         cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.03, pad=0.02)
-        cbar1.set_label("class id")
-        if class_names and len(class_names) <= 20:
+
+        if class_names is not None:
+            cbar1.set_label("class")
             cbar1.set_ticks(np.arange(C))
             cbar1.set_ticklabels(class_names)
+        else:
+            cbar1.set_label("class id")
 
         # (3) Pred band
         ax2 = plt.subplot(rows, 1, 3, sharex=ax0)
@@ -243,7 +246,13 @@ def save_gt_pred_plot(
         ax2.set_yticks([]); ax2.set_xticks([])
         ax2.set_title("Pred inst (per-time class id)")
         cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.03, pad=0.02)
-        cbar2.set_label("class id")
+
+        if class_names is not None:
+            cbar2.set_label("class")
+            cbar2.set_ticks(np.arange(C))
+            cbar2.set_ticklabels(class_names)
+        else:
+            cbar2.set_label("class id")
 
         # (4) Attn heatmap
         if use_attn:

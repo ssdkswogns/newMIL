@@ -37,7 +37,8 @@ from lookhead import Lookahead
 import warnings
 
 from models.timemil_old import newTimeMIL, AmbiguousMIL
-from models.timemil import TimeMIL
+from models.millet import MILLET
+from models.timemil import TimeMIL, originalTimeMIL
 from models.expmil import AmbiguousMILwithCL
 from compute_aopcr import compute_classwise_aopcr
 
@@ -424,6 +425,10 @@ def train(trainloader, milnet, criterion, optimizer, epoch, args, device, proto_
             bag_prediction, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = milnet(
                 bag_feats
             )
+        elif args.model == 'MILLET':
+            bag_prediction, instance_pred, interpretation = milnet(bag_feats)
+            weighted_instance_pred = None
+            x_cls, x_seq = None, None
         else:
             if epoch < args.epoch_des:
                 bag_prediction, x_cls, attn_layer1, attn_layer2 = milnet(bag_feats, warmup=True)
@@ -580,7 +585,12 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
 
             if args.model == 'AmbiguousMIL':
                 bag_prediction, instance_pred, weighted_instance_pred, non_weighted_instance_pred, x_cls, x_seq, attn_layer1, attn_layer2 = milnet(bag_feats)
-            elif args.model == 'newTimeMIL':
+            elif args.model == 'MILLET':
+                bag_prediction, instance_pred, interpretation = model(bag_feats)
+                weighted_instance_pred = None
+                attn_layer2 = None
+                x_seq = None
+            elif args.model == 'newTimeMIL' or args.model == 'TimeMIL':
                 out = model(bag_feats)
                 instance_pred = None
                 attn_layer2 = None
@@ -589,15 +599,15 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                     attn_layer2 = out[3]
                 else:
                     bag_prediction = out
-            elif args.model == 'TimeMIL':
-                out = model(bag_feats)
-                instance_pred = None
-                attn_layer2 = None
-                if isinstance(out, (tuple, list)):
-                    bag_prediction = out[0]
-                    attn_layer2 = out[2]
-                else:
-                    bag_prediction = out
+            # elif args.model == 'TimeMIL':
+            #     out = model(bag_feats)
+            #     instance_pred = None
+            #     attn_layer2 = None
+            #     if isinstance(out, (tuple, list)):
+            #         bag_prediction = out[0]
+            #         attn_layer2 = out[2]
+            #     else:
+            #         bag_prediction = out
             else:
                 raise ValueError(f"Unknown model name: {args.model}")
 
@@ -669,7 +679,9 @@ def test(testloader, milnet, criterion, epoch, args, device, threshold: float = 
                 # AmbiguousMIL인 경우 instance_pred에서 직접 argmax
                 if args.model == 'AmbiguousMIL':
                     pred_inst = torch.argmax(weighted_instance_pred, dim=2)  # [B, T]
-                elif args.model == 'newTimeMIL' and attn_layer2 is not None:
+                elif args.model == 'MILLET' and instance_pred is not None:
+                    pred_inst = torch.argmax(instance_pred, dim=2)  # [B, T]
+                elif args.model in ['newTimeMIL', 'TimeMIL'] and attn_layer2 is not None:
                     B, T, C = y_inst.shape
                     attn_cls = attn_layer2[:,:,:C,C:]
                     attn_mean = attn_cls.mean(dim=1)
@@ -838,6 +850,9 @@ def main():
     parser.add_argument('--dba_window', type=int, default=12000, help='Sliding window length (time steps) for DBA dataset')
     parser.add_argument('--dba_stride', type=int, default=6000, help='Sliding window stride for DBA dataset')
     parser.add_argument('--dba_test_ratio', type=float, default=0.2, help='Train/Test split ratio (sequence-level) for DBA dataset')
+    
+    parser.add_argument('--millet_pooling', default='conjunctive', type=str,
+                        help="Pooling for MILLET (conjunctive | attention | instance | additive | gap)")
     
     parser.add_argument('--use_softclt_aux', action='store_true',
                         help='Use SoftCLT (instance-wise + temporal) auxiliary losses instead of proto_inst_loss')
@@ -1113,7 +1128,7 @@ def main():
 
     # ---------------- 모델 구성 ----------------
     if args.model =='TimeMIL':
-        base_model = TimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len).to(device)
+        base_model = originalTimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len, is_instance=True).to(device)
         proto_bank = None
     elif args.model == 'newTimeMIL':
         base_model = TimeMIL(args.feats_size,mDim=args.embed,n_classes =num_classes,dropout=args.dropout_node, max_seq_len = seq_len, is_instance=True).to(device)
@@ -1126,6 +1141,11 @@ def main():
             device=device,
             momentum=0.9,
         )
+    elif args.model == 'MILLET':
+        base_model = MILLET(args.feats_size, mDim=args.embed, n_classes=num_classes,
+                            dropout=args.dropout_node, max_seq_len=seq_len,
+                            pooling=args.millet_pooling, is_instance=True).to(device)
+        proto_bank = None
     else:
         raise Exception("Model not available")
 
@@ -1154,11 +1174,11 @@ def main():
         batch = 64
     elif args.dataset in ['Heartbeat']:
         batch = 32
-    elif args.dataset in ['EthanolConcentration','NATOPS','JapaneseVowels','MotorImagery','SelfRegulationSCP1']:
+    elif args.dataset in ['EthanolConcentration','NATOPS','JapaneseVowels','SelfRegulationSCP1']:
         batch = 16
     elif args.dataset in ['PEMS-SF','SelfRegulationSCP2','AtrialFibrillation','Cricket']:
         batch = 8
-    elif args.dataset in ['StandWalkJump']:
+    elif args.dataset in ['StandWalkJump','MotorImagery']:
         batch = 1
     elif args.dataset in ['Libras','Handwriting','Epilepsy']:
         batch = 128
@@ -1378,14 +1398,24 @@ def main():
 
         # rebuild evaluation model with is_instance=True when available
         if args.model == 'TimeMIL':
-            eval_model = TimeMIL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
-                                 dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
+            eval_model = originalTimeMIL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
+                                    dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
         elif args.model == 'newTimeMIL':
             eval_model = TimeMIL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
                                     dropout=args.dropout_node, max_seq_len=args.seq_len, is_instance=True).to(device)
         elif args.model == 'AmbiguousMIL':
             eval_model = AmbiguousMILwithCL(args.feats_size, mDim=args.embed, n_classes=args.num_classes,
                                             dropout=args.dropout_node, is_instance=True).to(device)
+        elif args.model == 'MILLET':
+            eval_model = MILLET(
+                args.feats_size,
+                mDim=args.embed,
+                n_classes=args.num_classes,
+                dropout=args.dropout_node,
+                max_seq_len=args.seq_len,
+                pooling=args.millet_pooling,
+                is_instance=True
+            ).to(device)
         else:
             eval_model = None
 
