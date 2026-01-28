@@ -34,6 +34,7 @@ from dba_dataloader import build_dba_for_timemil, build_dba_windows_for_mixed
 from syntheticdataset import MixedSyntheticBagsConcatK
 from models.expmil import AmbiguousMILwithCL
 from models.millet import MILLET
+from models.timemil import TimeMIL, originalTimeMIL
 
 
 def maybe_mkdir_p(p):
@@ -106,6 +107,9 @@ def main():
         model = MILLET(feats_size=in_dim, mDim=args.embed, n_classes=num_classes,
             dropout=0.0, max_seq_len=seq_len,
             pooling='conjunctive', is_instance=True).to(device)
+    elif args.model == 'newTimeMIL':
+        model = TimeMIL(feats_size=in_dim, mDim=args.embed, n_classes=num_classes, 
+            dropout=0.0, max_seq_len=seq_len, is_instance=True).to(device)
 
     state = torch.load(args.ckpt, map_location=device)
     model.load_state_dict(state)
@@ -127,6 +131,11 @@ def main():
             out = model(feats)
             bag_prediction, inst_logits, interpretation = out
             weighted_logits = interpretation.transpose(1, 2)  # [B,T,C]
+        elif args.model == 'newTimeMIL':
+            out = model(feats)
+            logits, x_cls, attn_layer1, attn_layer2 = out
+            attn_cls2time = attn_layer2[:, :num_classes, num_classes:]
+            weighted_logits = attn_cls2time.transpose(1, 2)  # [B,T,C]
 
         # hard label: argmax over class dimension
         y_hat = torch.argmax(weighted_logits, dim=-1)  # [B,T]
